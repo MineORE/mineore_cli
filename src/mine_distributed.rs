@@ -3,12 +3,13 @@ use crate::send_and_confirm::ComputeBudget;
 use crate::utils::{get_config, proof_pubkey};
 use crate::Miner;
 use crate::{args::MineDistributedArgs, utils::get_proof_with_authority};
-use drillx::Solution;
+use drillx::{equix, Hash, Solution};
 use ore_api::state::Proof;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
+use solana_rpc_client::spinner;
 use solana_sdk::signer::Signer;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -19,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 #[derive(Serialize, Deserialize)]
 struct WorkerResult {
@@ -31,11 +32,14 @@ struct WorkerResult {
 struct WorkerRequest {
     pub proof: SerializableProof,
     pub cutoff_time: u64,
+    pub thread_offset: u64,
+    pub total_threads: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AuthRequest {
     pub pubkey: String,
+    pub thread_count: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,8 +162,10 @@ impl Miner {
         ))
         .await
         .unwrap();
-        let workers: Arc<Mutex<HashMap<String, mpsc::Sender<WorkerRequest>>>> =
+        let workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let total_threads: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+
         let signer = self.signer();
 
         // Channel for collecting results
@@ -169,9 +175,15 @@ impl Miner {
         let worker_handler = Arc::clone(&self);
         let workers_clone = Arc::clone(&workers);
         let result_sender_clone = result_sender.clone();
+        let total_threads_clone = Arc::clone(&total_threads);
         task::spawn(async move {
             worker_handler
-                .handle_new_connections(listener, workers_clone, result_sender_clone)
+                .handle_new_connections(
+                    listener,
+                    workers_clone,
+                    result_sender_clone,
+                    total_threads_clone,
+                )
                 .await;
         });
 
@@ -181,15 +193,37 @@ impl Miner {
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
             let serializable_proof = SerializableProof::from(&proof);
 
-            let request = WorkerRequest {
-                proof: serializable_proof,
-                cutoff_time,
-            };
+            let mut worker_offsets = Vec::new();
+            let current_total_threads;
 
-            // Send the request to all current workers
-            for tx in workers.lock().await.values() {
-                tx.send(request.clone()).await.unwrap();
+            {
+                let workers_lock = workers.lock().await;
+                let mut offset = 0;
+                for (_, (_, thread_count, _)) in workers_lock.iter() {
+                    worker_offsets.push(offset);
+                    offset += thread_count;
+                }
+                current_total_threads = *total_threads.lock().await;
             }
+
+            let mut offset_index = 0;
+            for (_addr, (tx, _thread_count, offset)) in workers.lock().await.iter_mut() {
+                let request = WorkerRequest {
+                    proof: serializable_proof.clone(),
+                    cutoff_time,
+                    thread_offset: worker_offsets[offset_index],
+                    total_threads: current_total_threads,
+                };
+                tx.send(request).await.unwrap();
+                *offset = worker_offsets[offset_index].try_into().unwrap();
+                offset_index += 1;
+            }
+
+            println!(
+                "Distributed mining task to {} workers with a total of {} threads",
+                workers.lock().await.len(),
+                current_total_threads
+            );
 
             // Wait for cutoff time to end
             let wait_duration = Duration::from_secs(cutoff_time);
@@ -237,11 +271,28 @@ impl Miner {
         }
     }
 
+    async fn handle_worker_disconnection(
+        addr_str: &str,
+        workers: &Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
+        total_threads: &Arc<Mutex<u64>>,
+    ) {
+        let mut workers_lock = workers.lock().await;
+        if let Some((_, thread_count, _)) = workers_lock.remove(addr_str) {
+            let mut total = total_threads.lock().await;
+            *total -= thread_count;
+            println!(
+                "Worker {} disconnected. Removed {} threads. Total threads: {}",
+                addr_str, thread_count, *total
+            );
+        }
+    }
+
     async fn handle_new_connections(
         self: Arc<Self>,
         listener: TcpListener,
-        workers: Arc<Mutex<HashMap<String, mpsc::Sender<WorkerRequest>>>>,
+        workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
         result_sender: mpsc::Sender<WorkerResult>,
+        total_threads: Arc<Mutex<u64>>,
     ) {
         loop {
             match listener.accept().await {
@@ -250,17 +301,33 @@ impl Miner {
                     println!("New connection from: {}", addr_str);
 
                     // Authenticate worker
-                    if !self.authenticate_worker(&mut socket).await {
-                        println!("Authentication failed for worker: {}", addr_str);
-                        continue;
-                    }
-                    println!("Worker authenticated: {}", addr_str);
+                    let thread_count = match self.authenticate_worker(&mut socket).await {
+                        Some(count) => count,
+                        None => {
+                            println!("Authentication failed for worker: {}", addr_str);
+                            continue;
+                        }
+                    };
+                    println!(
+                        "Worker authenticated: {} with {} threads",
+                        addr_str, thread_count
+                    );
 
                     let (tx, mut rx) = mpsc::channel(10);
-                    workers.lock().await.insert(addr_str.clone(), tx);
+                    workers
+                        .lock()
+                        .await
+                        .insert(addr_str.clone(), (tx, thread_count, 0));
+
+                    // Increase total threads
+                    {
+                        let mut total = total_threads.lock().await;
+                        *total += thread_count;
+                    }
 
                     let workers_clone = Arc::clone(&workers);
                     let result_sender_clone = result_sender.clone();
+                    let total_threads_clone = Arc::clone(&total_threads);
 
                     // Spawn a task to handle this worker
                     task::spawn(async move {
@@ -287,7 +354,13 @@ impl Miner {
                                 }
                             }
                         }
-                        workers_clone.lock().await.remove(&addr_str);
+                        // Worker disconnected, remove it and decrease total threads
+                        Self::handle_worker_disconnection(
+                            &addr_str,
+                            &workers_clone,
+                            &total_threads_clone,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -295,6 +368,100 @@ impl Miner {
                 }
             }
         }
+    }
+
+    pub async fn find_hash_par_worker(
+        proof: Proof,
+        cutoff_time: u64,
+        threads: u64,
+        min_difficulty: u32,
+        thread_offset: u64,
+        total_threads: u64,
+    ) -> (Solution, u32) {
+        // Dispatch job to each thread
+        let progress_bar = Arc::new(spinner::new_progress_bar());
+        progress_bar.set_message("Mining...");
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                std::thread::spawn({
+                    let proof = proof.clone();
+                    let progress_bar = progress_bar.clone();
+                    let mut memory = equix::SolverMemory::new();
+                    move || {
+                        let timer = Instant::now();
+                        let global_thread_id = thread_offset + i;
+                        let mut nonce = u64::MAX
+                            .saturating_div(total_threads)
+                            .saturating_mul(global_thread_id);
+                        let mut best_nonce = nonce;
+                        let mut best_difficulty = 0;
+                        let mut best_hash = Hash::default();
+                        loop {
+                            // Create hash
+                            if let Ok(hx) = drillx::hash_with_memory(
+                                &mut memory,
+                                &proof.challenge,
+                                &nonce.to_le_bytes(),
+                            ) {
+                                let difficulty = hx.difficulty();
+                                if difficulty.gt(&best_difficulty) {
+                                    best_nonce = nonce;
+                                    best_difficulty = difficulty;
+                                    best_hash = hx;
+                                }
+                            }
+
+                            // Exit if time has elapsed
+                            if nonce % 100 == 0 {
+                                if timer.elapsed().as_secs().ge(&cutoff_time) {
+                                    if best_difficulty.ge(&min_difficulty) {
+                                        // Mine until min difficulty has been met
+                                        break;
+                                    }
+                                } else if i == 0 {
+                                    progress_bar.set_message(format!(
+                                        "Mining... ({} sec remaining)",
+                                        cutoff_time.saturating_sub(timer.elapsed().as_secs()),
+                                    ));
+                                }
+                            }
+
+                            // Increment nonce
+                            nonce += 1;
+                        }
+
+                        // Return the best nonce
+                        (best_nonce, best_difficulty, best_hash)
+                    }
+                })
+            })
+            .collect();
+
+        // Join handles and return best nonce
+        let mut best_nonce = 0;
+        let mut best_difficulty = 0;
+        let mut best_hash = Hash::default();
+        for h in handles {
+            if let Ok((nonce, difficulty, hash)) = h.join() {
+                if difficulty > best_difficulty {
+                    best_difficulty = difficulty;
+                    best_nonce = nonce;
+                    best_hash = hash;
+                }
+            }
+        }
+
+        // Update log
+        progress_bar.finish_with_message(format!(
+            "Best hash: {} (difficulty: {})",
+            bs58::encode(best_hash.h).into_string(),
+            best_difficulty
+        ));
+
+        (
+            Solution::new(best_hash.d, best_nonce.to_le_bytes()),
+            best_difficulty,
+        )
     }
 
     async fn work(self: Arc<Self>, args: MineDistributedArgs) {
@@ -305,7 +472,10 @@ impl Miner {
         println!("Connected to coordinator");
 
         // Authenticate with the server
-        if !self.authenticate_with_server(&mut stream).await {
+        if !self
+            .authenticate_with_server(&mut stream, args.threads)
+            .await
+        {
             println!("Authentication with server failed");
             return;
         }
@@ -325,16 +495,18 @@ impl Miner {
             let config = get_config(&self.rpc_client).await;
 
             println!(
-                "Received new mining request. Cutoff time: {} seconds",
-                worker_request.cutoff_time
+                "Received new mining request. Cutoff time: {} seconds, Thread offset: {}, Total threads: {}",
+                worker_request.cutoff_time, worker_request.thread_offset, worker_request.total_threads
             );
 
             // Mine using existing parallel mining code
-            let (solution, best_difficulty) = Self::find_hash_par(
+            let (solution, best_difficulty) = Self::find_hash_par_worker(
                 proof,
                 worker_request.cutoff_time,
                 args.threads,
                 config.min_difficulty as u32,
+                worker_request.thread_offset,
+                worker_request.total_threads,
             )
             .await;
 
@@ -353,12 +525,12 @@ impl Miner {
         }
     }
 
-    async fn authenticate_worker(&self, socket: &mut TcpStream) -> bool {
+    async fn authenticate_worker(&self, socket: &mut TcpStream) -> Option<u64> {
         let auth_request: AuthRequest = receive_message(socket).await.unwrap();
 
         println!("Received authentication request from worker");
 
-        let is_authentic = !auth_request.pubkey.is_empty();
+        let is_authentic = !auth_request.pubkey.is_empty() && auth_request.thread_count > 0;
 
         let response = AuthResponse {
             success: is_authentic,
@@ -373,12 +545,17 @@ impl Miner {
             .await
             .unwrap();
 
-        is_authentic
+        if is_authentic {
+            Some(auth_request.thread_count)
+        } else {
+            None
+        }
     }
 
-    async fn authenticate_with_server(&self, stream: &mut TcpStream) -> bool {
+    async fn authenticate_with_server(&self, stream: &mut TcpStream, thread_count: u64) -> bool {
         let auth_request = AuthRequest {
             pubkey: self.signer().pubkey().to_string(),
+            thread_count,
         };
 
         send_message(stream, MessageType::AuthRequest, &auth_request)
