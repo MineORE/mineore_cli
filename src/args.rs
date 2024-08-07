@@ -113,3 +113,28 @@ pub struct UpgradeArgs {
     )]
     pub amount: Option<f64>,
 }
+
+#[derive(Parser, Debug)]
+pub struct MineDistributedArgs {
+    #[arg(long, help = "Role: 'coordinator' or 'worker'")]
+    pub role: String,
+    #[arg(long, help = "Coordinator address (required for worker)")]
+    pub coordinator: Option<String>,
+    #[arg(
+        long,
+        short,
+        value_name = "THREAD_COUNT",
+        help = "The number of CPU threads to allocate to mining",
+        default_value = "1"
+    )]
+    pub threads: u64,
+
+    #[arg(
+        long,
+        short,
+        value_name = "SECONDS",
+        help = "The number seconds before the deadline to stop mining and start submitting",
+        default_value = "5"
+    )]
+    pub buffer_time: u64,
+}

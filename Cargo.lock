@@ -1382,8 +1382,6 @@ dependencies = [
 [[package]]
 name = "drillx"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c5fd3a8f11a6420d6efb1952c8c2e788627cb2c9e834537dc4b6bd036461646"
 dependencies = [
  "equix",
  "serde",
@@ -1522,9 +1520,9 @@ checksum = "5443807d6dff69373d433ab9ef5378ad8df50ca6298caf15de6e52e24aaf54d5"
 
 [[package]]
 name = "equix"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced5aa2974d730a3bbe65dcb62ad8fbb0ae44d4aeed1093808a855d922b931ee"
+checksum = "fec26c5c7c2fd421b3b7f9b7c069a7fdc2eae9cf78ab3d22c661e1d0e369c25f"
 dependencies = [
  "arrayvec",
  "hashx",
@@ -2777,6 +2775,7 @@ dependencies = [
  "ore-utils",
  "rand 0.8.5",
  "reqwest 0.12.4",
+ "serde",
  "serde_json",
  "solana-cli-config",
  "solana-client",

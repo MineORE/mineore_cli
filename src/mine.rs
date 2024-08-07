@@ -42,9 +42,14 @@ impl Miner {
             // Calc cutoff time
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
 
+            println!(
+                "Mining for {} seconds (buffer: {} sec)",
+                cutoff_time, args.buffer_time
+            );
+
             // Run drillx
             let config = get_config(&self.rpc_client).await;
-            let solution = Self::find_hash_par(
+            let (solution, _) = Self::find_hash_par(
                 proof,
                 cutoff_time,
                 args.threads,
@@ -71,12 +76,12 @@ impl Miner {
         }
     }
 
-    async fn find_hash_par(
+    pub async fn find_hash_par(
         proof: Proof,
         cutoff_time: u64,
         threads: u64,
         min_difficulty: u32,
-    ) -> Solution {
+    ) -> (Solution, u32) {
         // Dispatch job to each thread
         let progress_bar = Arc::new(spinner::new_progress_bar());
         progress_bar.set_message("Mining...");
@@ -154,7 +159,10 @@ impl Miner {
             best_difficulty
         ));
 
-        Solution::new(best_hash.d, best_nonce.to_le_bytes())
+        (
+            Solution::new(best_hash.d, best_nonce.to_le_bytes()),
+            best_difficulty,
+        )
     }
 
     pub fn check_num_cores(&self, threads: u64) {
@@ -170,7 +178,7 @@ impl Miner {
         }
     }
 
-    async fn should_reset(&self, config: Config) -> bool {
+    pub async fn should_reset(&self, config: Config) -> bool {
         let clock = get_clock(&self.rpc_client).await;
         config
             .last_reset_at
@@ -179,8 +187,9 @@ impl Miner {
             .le(&clock.unix_timestamp)
     }
 
-    async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
+    pub async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
         let clock = get_clock(&self.rpc_client).await;
+        println!("Last hash at: {}", proof.last_hash_at);
         proof
             .last_hash_at
             .saturating_add(60)
@@ -191,7 +200,7 @@ impl Miner {
 }
 
 // TODO Pick a better strategy (avoid draining bus)
-fn find_bus() -> Pubkey {
+pub fn find_bus() -> Pubkey {
     let i = rand::thread_rng().gen_range(0..BUS_COUNT);
     BUS_ADDRESSES[i]
 }

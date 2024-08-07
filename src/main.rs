@@ -6,16 +6,17 @@ mod claim;
 mod close;
 mod config;
 mod cu_limits;
+mod dynamic_fee;
 #[cfg(feature = "admin")]
 mod initialize;
 mod mine;
+mod mine_distributed;
 mod open;
 mod rewards;
 mod send_and_confirm;
 mod stake;
 mod upgrade;
 mod utils;
-mod dynamic_fee;
 
 use std::sync::Arc;
 
@@ -67,6 +68,9 @@ enum Commands {
 
     #[command(about = "Upgrade your ORE tokens from v1 to v2")]
     Upgrade(UpgradeArgs),
+
+    #[command(about = "Mining distributed")]
+    MineDistributed(MineDistributedArgs),
 
     #[cfg(feature = "admin")]
     #[command(about = "Initialize the program")]
@@ -134,7 +138,6 @@ struct Args {
         global = true
     )]
     dynamic_fee_max: Option<u64>,
-    
 
     #[command(subcommand)]
     command: Commands,
@@ -205,6 +208,9 @@ async fn main() {
         #[cfg(feature = "admin")]
         Commands::Initialize(_) => {
             miner.initialize().await;
+        }
+        Commands::MineDistributed(args) => {
+            miner.mine_distributed(args).await;
         }
     }
 }
