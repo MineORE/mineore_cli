@@ -120,6 +120,8 @@ pub struct MineDistributedArgs {
     pub role: String,
     #[arg(long, help = "Coordinator address (required for worker)")]
     pub coordinator: Option<String>,
+    #[arg(long, help = "Coordinator port (required for coordinator)")]
+    pub coordinator_port: Option<String>,
     #[arg(
         long,
         short,

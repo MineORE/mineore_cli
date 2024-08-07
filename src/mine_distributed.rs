@@ -152,7 +152,12 @@ impl Miner {
     }
 
     async fn coordinate(self: Arc<Self>, args: MineDistributedArgs) {
-        let listener = TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        let listener = TcpListener::bind(format!(
+            "0.0.0.0:{}",
+            args.coordinator_port.unwrap_or("8080".to_string())
+        ))
+        .await
+        .unwrap();
         let workers: Arc<Mutex<HashMap<String, mpsc::Sender<WorkerRequest>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let signer = self.signer();
