@@ -36,7 +36,6 @@ struct Miner {
     pub dynamic_fee_max: Option<u64>,
     pub rpc_client: Arc<RpcClient>,
     pub fee_payer_filepath: Option<String>,
-    pub total_threads: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -247,7 +246,6 @@ impl Miner {
             dynamic_fee_strategy,
             dynamic_fee_max,
             fee_payer_filepath,
-            total_threads: 0,
         }
     }
 
