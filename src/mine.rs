@@ -191,7 +191,6 @@ impl Miner {
 
     pub async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
         let clock = get_clock(&self.rpc_client).await;
-        println!("Last hash at: {}", proof.last_hash_at);
         proof
             .last_hash_at
             .saturating_add(60)

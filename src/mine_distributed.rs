@@ -6,6 +6,7 @@ use crate::{args::MineDistributedArgs, utils::get_proof_with_authority};
 use drillx::Solution;
 use ore_api::state::Proof;
 use rand::Rng;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
@@ -88,6 +89,59 @@ impl SerializableProof {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+enum MessageType {
+    AuthRequest,
+    AuthResponse,
+    WorkerRequest,
+    WorkerResult,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MessageHeader {
+    message_type: MessageType,
+    payload_size: u32,
+}
+
+async fn send_message<T: Serialize>(
+    stream: &mut TcpStream,
+    message_type: MessageType,
+    payload: &T,
+) -> std::io::Result<()> {
+    let payload_bytes = bincode::serialize(payload).unwrap();
+    let header = MessageHeader {
+        message_type,
+        payload_size: payload_bytes.len() as u32,
+    };
+    let header_bytes = bincode::serialize(&header).unwrap();
+
+    stream
+        .write_all(&(header_bytes.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(&header_bytes).await?;
+    stream.write_all(&payload_bytes).await?;
+    stream.flush().await?;
+
+    Ok(())
+}
+
+async fn receive_message<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<T> {
+    let mut header_size_bytes = [0u8; 4];
+    stream.read_exact(&mut header_size_bytes).await?;
+    let header_size = u32::from_be_bytes(header_size_bytes) as usize;
+
+    let mut header_bytes = vec![0u8; header_size];
+    stream.read_exact(&mut header_bytes).await?;
+    let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
+
+    let mut payload_bytes = vec![0u8; header.payload_size as usize];
+    stream.read_exact(&mut payload_bytes).await?;
+
+    let payload: T = bincode::deserialize(&payload_bytes).unwrap();
+
+    Ok(payload)
+}
+
 impl Miner {
     pub async fn mine_distributed(self: Arc<Self>, args: MineDistributedArgs) {
         match args.role.as_str() {
@@ -134,7 +188,8 @@ impl Miner {
 
             // Wait for cutoff time to end
             let wait_duration = Duration::from_secs(cutoff_time);
-            sleep(wait_duration).await;
+            println!("Waiting for {} seconds...", cutoff_time);
+            sleep(wait_duration + Duration::from_secs(3)).await; // Add 3 seconds buffer
 
             // Collect results
             let mut best_result: Option<WorkerResult> = None;
@@ -148,6 +203,10 @@ impl Miner {
 
             // Submit best result
             if let Some(result) = best_result {
+                println!(
+                    "Best result received. Best difficulty: {}.Submitting to network...",
+                    result.difficulty
+                );
                 let config = get_config(&self.rpc_client).await;
                 let solution = result.solution;
                 // Submit solution to the network
@@ -166,6 +225,9 @@ impl Miner {
                 self.send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
                     .await
                     .ok();
+            } else {
+                println!("No results received. Retrying in 3 seconds...");
+                sleep(Duration::from_secs(3)).await;
             }
         }
     }
@@ -198,20 +260,27 @@ impl Miner {
                     // Spawn a task to handle this worker
                     task::spawn(async move {
                         while let Some(request) = rx.recv().await {
-                            let request_bytes = bincode::serialize(&request).unwrap();
-                            if let Err(e) = socket.write_all(&request_bytes).await {
+                            if let Err(e) =
+                                send_message(&mut socket, MessageType::WorkerRequest, &request)
+                                    .await
+                            {
                                 println!("Failed to send request to worker {}: {}", addr_str, e);
                                 break;
                             }
 
                             // Wait for and forward the result
-                            let mut buf = Vec::new();
-                            if let Err(e) = socket.read_to_end(&mut buf).await {
-                                println!("Failed to read result from worker {}: {}", addr_str, e);
-                                break;
+                            match receive_message::<WorkerResult>(&mut socket).await {
+                                Ok(result) => {
+                                    result_sender_clone.send(result).await.unwrap();
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "Failed to read result from worker {}: {}",
+                                        addr_str, e
+                                    );
+                                    break;
+                                }
                             }
-                            let result: WorkerResult = bincode::deserialize(&buf).unwrap();
-                            result_sender_clone.send(result).await.unwrap();
                         }
                         workers_clone.lock().await.remove(&addr_str);
                     });
@@ -224,7 +293,10 @@ impl Miner {
     }
 
     async fn work(self: Arc<Self>, args: MineDistributedArgs) {
-        let mut stream = TcpStream::connect(args.coordinator.unwrap()).await.unwrap();
+        let mut stream =
+            TcpStream::connect(args.coordinator.expect("No coordinator URL specified!"))
+                .await
+                .unwrap();
         println!("Connected to coordinator");
 
         // Authenticate with the server
@@ -237,9 +309,13 @@ impl Miner {
         loop {
             println!("Waiting for next request from coordinator...");
             // Receive proof from coordinator
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.unwrap();
-            let worker_request: WorkerRequest = bincode::deserialize(&buf).unwrap();
+            let worker_request: WorkerRequest = match receive_message(&mut stream).await {
+                Ok(request) => request,
+                Err(e) => {
+                    println!("Error receiving worker request: {}", e);
+                    break;
+                }
+            };
             let proof = worker_request.proof.to_proof();
             let config = get_config(&self.rpc_client).await;
 
@@ -264,19 +340,19 @@ impl Miner {
                 difficulty: best_difficulty,
                 solution,
             };
-            let result_bytes = bincode::serialize(&result).unwrap();
-            stream.write_all(&result_bytes).await.unwrap();
+            if let Err(e) = send_message(&mut stream, MessageType::WorkerResult, &result).await {
+                println!("Error sending mining result to coordinator: {}", e);
+                break;
+            }
             println!("Sent mining result to coordinator");
         }
     }
 
     async fn authenticate_worker(&self, socket: &mut TcpStream) -> bool {
-        let mut buf = Vec::new();
-        socket.read_to_end(&mut buf).await.unwrap();
-        let auth_request: AuthRequest = bincode::deserialize(&buf).unwrap();
+        let auth_request: AuthRequest = receive_message(socket).await.unwrap();
 
-        // Implement your authentication logic here
-        // For this example, we'll just check if the pubkey is not empty
+        println!("Received authentication request from worker");
+
         let is_authentic = !auth_request.pubkey.is_empty();
 
         let response = AuthResponse {
@@ -288,8 +364,9 @@ impl Miner {
             },
         };
 
-        let response_bytes = bincode::serialize(&response).unwrap();
-        socket.write_all(&response_bytes).await.unwrap();
+        send_message(socket, MessageType::AuthResponse, &response)
+            .await
+            .unwrap();
 
         is_authentic
     }
@@ -298,12 +375,14 @@ impl Miner {
         let auth_request = AuthRequest {
             pubkey: self.signer().pubkey().to_string(),
         };
-        let auth_bytes = bincode::serialize(&auth_request).unwrap();
-        stream.write_all(&auth_bytes).await.unwrap();
 
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        let auth_response: AuthResponse = bincode::deserialize(&buf).unwrap();
+        send_message(stream, MessageType::AuthRequest, &auth_request)
+            .await
+            .unwrap();
+
+        println!("Sent authentication request to server");
+
+        let auth_response: AuthResponse = receive_message(stream).await.unwrap();
 
         auth_response.success
     }
