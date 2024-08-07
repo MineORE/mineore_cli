@@ -3,10 +3,7 @@ use crate::send_and_confirm::ComputeBudget;
 use crate::utils::{get_config, proof_pubkey};
 use crate::Miner;
 use crate::{args::MineDistributedArgs, utils::get_proof_with_authority};
-use drillx::{
-    equix::{self},
-    Hash, Solution,
-};
+use drillx::Solution;
 use ore_api::state::Proof;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
