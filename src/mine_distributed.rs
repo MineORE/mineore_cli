@@ -526,9 +526,17 @@ impl Miner {
     }
 
     async fn authenticate_worker(&self, socket: &mut TcpStream) -> Option<u64> {
-        let auth_request: AuthRequest = receive_message(socket)
-            .await
-            .expect("Failed to read message");
+        let auth_request: Result<AuthRequest, std::io::Error> = receive_message(socket).await;
+
+        if let Err(e) = auth_request {
+            println!(
+                "Failed to receive authentication request from worker: {}",
+                e
+            );
+            return None;
+        }
+
+        let auth_request = auth_request.unwrap();
 
         println!("Received authentication request from worker");
 
