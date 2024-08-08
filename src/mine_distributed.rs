@@ -526,7 +526,9 @@ impl Miner {
     }
 
     async fn authenticate_worker(&self, socket: &mut TcpStream) -> Option<u64> {
-        let auth_request: AuthRequest = receive_message(socket).await.unwrap();
+        let auth_request: AuthRequest = receive_message(socket)
+            .await
+            .expect("Failed to read message");
 
         println!("Received authentication request from worker");
 
