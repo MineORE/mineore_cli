@@ -279,7 +279,12 @@ impl Miner {
                     solution,
                 ));
                 match self
-                    .send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
+                    .send_and_confirm(
+                        &ixs,
+                        ComputeBudget::Fixed(compute_budget),
+                        false,
+                        proof.last_hash_at,
+                    )
                     .await
                 {
                     Ok(_) => {

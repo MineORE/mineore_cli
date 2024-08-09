@@ -18,7 +18,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
-use crate::Miner;
+use crate::{proof, utils::get_proof_with_authority, Miner};
 
 const MIN_SOL_BALANCE: f64 = 0.005;
 
@@ -41,6 +41,7 @@ impl Miner {
         ixs: &[Instruction],
         compute_budget: ComputeBudget,
         skip_confirm: bool,
+        last_hash_at: i64,
     ) -> ClientResult<Signature> {
         let signer = self.signer();
         let client = self.rpc_client.clone();
@@ -104,8 +105,8 @@ impl Miner {
                 }
 
                 // Resign the tx
-                let (hash, _slot) = client
-                    .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+                let (hash, _slot) = send_client
+                    .get_latest_blockhash_with_commitment(self.send_rpc_client.commitment())
                     .await
                     .unwrap();
                 if signer.pubkey() == fee_payer.pubkey() {
@@ -130,46 +131,54 @@ impl Miner {
                     // Confirm transaction
                     for _ in 0..CONFIRM_RETRIES {
                         std::thread::sleep(Duration::from_millis(CONFIRM_DELAY));
-                        match client.get_signature_statuses(&[sig]).await {
-                            Ok(signature_statuses) => {
-                                for status in signature_statuses.value {
-                                    if let Some(status) = status {
-                                        if let Some(err) = status.err {
-                                            progress_bar.finish_with_message(format!(
-                                                "{}: {}",
-                                                "ERROR".bold().red(),
-                                                err
-                                            ));
-                                            return Err(ClientError {
-                                                request: None,
-                                                kind: ClientErrorKind::Custom(err.to_string()),
-                                            });
-                                        }
-                                        if let Some(confirmation) = status.confirmation_status {
-                                            match confirmation {
-                                                TransactionConfirmationStatus::Processed => {}
-                                                TransactionConfirmationStatus::Confirmed
-                                                | TransactionConfirmationStatus::Finalized => {
-                                                    progress_bar.finish_with_message(format!(
-                                                        "{} {}",
-                                                        "OK".bold().green(),
-                                                        sig
-                                                    ));
-                                                    return Ok(sig);
+                        if last_hash_at > 0 {
+                            let proof = get_proof_with_authority(&client, signer.pubkey()).await;
+                            if proof.last_hash_at > last_hash_at {
+                                progress_bar.finish_with_message(format!("Sent: {}", sig));
+                                return Ok(sig);
+                            }
+                        } else {
+                            match client.get_signature_statuses(&[sig]).await {
+                                Ok(signature_statuses) => {
+                                    for status in signature_statuses.value {
+                                        if let Some(status) = status {
+                                            if let Some(err) = status.err {
+                                                progress_bar.finish_with_message(format!(
+                                                    "{}: {}",
+                                                    "ERROR".bold().red(),
+                                                    err
+                                                ));
+                                                return Err(ClientError {
+                                                    request: None,
+                                                    kind: ClientErrorKind::Custom(err.to_string()),
+                                                });
+                                            }
+                                            if let Some(confirmation) = status.confirmation_status {
+                                                match confirmation {
+                                                    TransactionConfirmationStatus::Processed => {}
+                                                    TransactionConfirmationStatus::Confirmed
+                                                    | TransactionConfirmationStatus::Finalized => {
+                                                        progress_bar.finish_with_message(format!(
+                                                            "{} {}",
+                                                            "OK".bold().green(),
+                                                            sig
+                                                        ));
+                                                        return Ok(sig);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // Handle confirmation errors
-                            Err(err) => {
-                                progress_bar.set_message(format!(
-                                    "{}: {}",
-                                    "ERROR".bold().red(),
-                                    err.kind().to_string()
-                                ));
+                                // Handle confirmation errors
+                                Err(err) => {
+                                    progress_bar.set_message(format!(
+                                        "{}: {}",
+                                        "ERROR".bold().red(),
+                                        err.kind().to_string()
+                                    ));
+                                }
                             }
                         }
                     }
