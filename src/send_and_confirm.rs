@@ -78,7 +78,7 @@ impl Miner {
             min_context_slot: None,
         };
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
-
+        let mut fee_retries = 1;
         // Submit tx
         let progress_bar = spinner::new_progress_bar();
         let mut attempts = 0;
@@ -93,7 +93,8 @@ impl Miner {
                         progress_bar.println(format!("  Priority fee: {} microlamports", fee));
                         fee
                     } else {
-                        let fee = self.priority_fee.unwrap_or(0);
+                        let fee = self.priority_fee.unwrap_or(0) + fee_retries * 2000;
+                        fee_retries += 1;
                         progress_bar.println(format!("  {} Dynamic fees not supported by this RPC. Falling back to static value: {} microlamports", "WARNING".bold().yellow(), fee));
                         fee
                     };
