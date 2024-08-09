@@ -185,11 +185,29 @@ impl Miner {
                 )
                 .await;
         });
+        let mut previous_proof = Proof {
+            authority: Pubkey::default(),
+            balance: 0,
+            challenge: [0u8; 32],
+            last_hash: [0u8; 32],
+            last_hash_at: 0,
+            last_stake_at: 0,
+            miner: Pubkey::default(),
+            total_hashes: 0,
+            total_rewards: 0,
+        };
 
         loop {
             // Main mining loop
             let proof = get_proof_with_authority(&self.rpc_client, signer.pubkey()).await;
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
+
+            if proof.eq(&previous_proof) {
+                println!("Proof has not changed. Skipping mining...");
+                sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+
             let serializable_proof = SerializableProof::from(&proof);
 
             let mut worker_offsets = Vec::new();
@@ -260,9 +278,20 @@ impl Miner {
                     self.as_ref().find_bus().await,
                     solution,
                 ));
-                self.send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
+                match self
+                    .send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
                     .await
-                    .ok();
+                {
+                    Ok(_) => {
+                        // Save proof to compare with next proof, if it's the same proof, then something wrong with RPC
+                        println!("Solution submitted successfully");
+                        println!("Saving proof to compare with next proof...");
+                        previous_proof = proof;
+                    }
+                    Err(e) => {
+                        println!("Failed to submit solution: {}", e);
+                    }
+                }
             } else {
                 println!("No results received. Retrying in 3 seconds...");
                 sleep(Duration::from_secs(3)).await;
