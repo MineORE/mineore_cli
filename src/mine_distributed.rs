@@ -1,4 +1,3 @@
-use crate::mine::find_bus;
 use crate::send_and_confirm::ComputeBudget;
 use crate::utils::{get_config, proof_pubkey};
 use crate::Miner;
@@ -258,7 +257,7 @@ impl Miner {
                 ixs.push(ore_api::instruction::mine(
                     signer.pubkey(),
                     signer.pubkey(),
-                    find_bus(),
+                    self.as_ref().find_bus().await,
                     solution,
                 ));
                 self.send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false)
