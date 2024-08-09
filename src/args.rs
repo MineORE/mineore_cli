@@ -138,4 +138,7 @@ pub struct MineDistributedArgs {
         default_value = "5"
     )]
     pub buffer_time: u64,
+
+    #[arg(long, help = "Use hack rpc")]
+    pub hack_rpc: bool,
 }

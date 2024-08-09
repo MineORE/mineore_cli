@@ -18,7 +18,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
-use crate::{proof, utils::get_proof_with_authority, Miner};
+use crate::{utils::get_proof_with_authority, Miner};
 
 const MIN_SOL_BALANCE: f64 = 0.005;
 
@@ -45,7 +45,6 @@ impl Miner {
     ) -> ClientResult<Signature> {
         let signer = self.signer();
         let client = self.rpc_client.clone();
-        let send_client = self.send_rpc_client.clone();
         let fee_payer = self.fee_payer();
 
         // Return error, if balance is zero
@@ -105,8 +104,8 @@ impl Miner {
                 }
 
                 // Resign the tx
-                let (hash, _slot) = send_client
-                    .get_latest_blockhash_with_commitment(self.send_rpc_client.commitment())
+                let (hash, _slot) = client
+                    .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
                     .await
                     .unwrap();
                 if signer.pubkey() == fee_payer.pubkey() {
@@ -117,10 +116,7 @@ impl Miner {
             }
 
             // Send transaction
-            match send_client
-                .send_transaction_with_config(&tx, send_cfg)
-                .await
-            {
+            match client.send_transaction_with_config(&tx, send_cfg).await {
                 Ok(sig) => {
                     // Skip confirmation
                     if skip_confirm {

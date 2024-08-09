@@ -283,7 +283,7 @@ impl Miner {
                         &ixs,
                         ComputeBudget::Fixed(compute_budget),
                         false,
-                        proof.last_hash_at,
+                        if args.hack_rpc { proof.last_hash_at } else { 0 },
                     )
                     .await
                 {
