@@ -44,6 +44,7 @@ impl Miner {
     ) -> ClientResult<Signature> {
         let signer = self.signer();
         let client = self.rpc_client.clone();
+        let send_client = self.send_rpc_client.clone();
         let fee_payer = self.fee_payer();
 
         // Return error, if balance is zero
@@ -115,7 +116,10 @@ impl Miner {
             }
 
             // Send transaction
-            match client.send_transaction_with_config(&tx, send_cfg).await {
+            match send_client
+                .send_transaction_with_config(&tx, send_cfg)
+                .await
+            {
                 Ok(sig) => {
                     // Skip confirmation
                     if skip_confirm {
