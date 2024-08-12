@@ -24,7 +24,7 @@ use solana_sdk::{
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
-use crate::utils::get_latest_blockhash_with_retries;
+use crate::utils::{get_latest_blockhash_with_retries, get_proof_with_authority};
 use crate::Miner;
 
 const MIN_SOL_BALANCE: f64 = 0.005;
@@ -118,7 +118,6 @@ impl Miner {
             min_context_slot: None,
         };
         let mut tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
-        let mut fee_retries = 1;
         // Submit tx
         let mut attempts = 0;
         loop {
@@ -183,12 +182,12 @@ impl Miner {
                                 return Ok(sig);
                             }
                         } else {
-                        match client.get_signature_statuses(&[sig]).await {
-                            Ok(signature_statuses) => {
-                                for status in signature_statuses.value {
-                                    if let Some(status) = status {
-                                        if let Some(err) = status.err {
-                                            match err {
+                            match client.get_signature_statuses(&[sig]).await {
+                                Ok(signature_statuses) => {
+                                    for status in signature_statuses.value {
+                                        if let Some(status) = status {
+                                            if let Some(err) = status.err {
+                                                match err {
                                                 // Instruction error
                                                 solana_sdk::transaction::TransactionError::InstructionError(_, err) => {
                                                     match err {
@@ -230,39 +229,40 @@ impl Miner {
                                                     });
                                                 }
                                             }
-                                        } else if let Some(confirmation) =
-                                            status.confirmation_status
-                                        {
-                                            match confirmation {
-                                                TransactionConfirmationStatus::Processed => {}
-                                                TransactionConfirmationStatus::Confirmed
-                                                | TransactionConfirmationStatus::Finalized => {
-                                                    let now = Local::now();
-                                                    let formatted_time =
-                                                        now.format("%Y-%m-%d %H:%M:%S").to_string();
-                                                    progress_bar.println(format!(
-                                                        "  Timestamp: {}",
-                                                        formatted_time
-                                                    ));
-                                                    progress_bar.finish_with_message(format!(
-                                                        "{} {}",
-                                                        "OK".bold().green(),
-                                                        sig
-                                                    ));
-                                                    return Ok(sig);
+                                            } else if let Some(confirmation) =
+                                                status.confirmation_status
+                                            {
+                                                match confirmation {
+                                                    TransactionConfirmationStatus::Processed => {}
+                                                    TransactionConfirmationStatus::Confirmed
+                                                    | TransactionConfirmationStatus::Finalized => {
+                                                        let now = Local::now();
+                                                        let formatted_time = now
+                                                            .format("%Y-%m-%d %H:%M:%S")
+                                                            .to_string();
+                                                        progress_bar.println(format!(
+                                                            "  Timestamp: {}",
+                                                            formatted_time
+                                                        ));
+                                                        progress_bar.finish_with_message(format!(
+                                                            "{} {}",
+                                                            "OK".bold().green(),
+                                                            sig
+                                                        ));
+                                                        return Ok(sig);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // Handle confirmation errors
-                            Err(err) => {
-                                log_error(&progress_bar, &err.kind().to_string(), false);
+                                // Handle confirmation errors
+                                Err(err) => {
+                                    log_error(&progress_bar, &err.kind().to_string(), false);
+                                }
                             }
                         }
-                    }
                     }
                 }
 
