@@ -1,4 +1,3 @@
-use std::{sync::Arc, sync::RwLock, time::Instant};
 use colored::*;
 use drillx::{
     equix::{self},
@@ -13,6 +12,7 @@ use rand::Rng;
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
 use solana_sdk::signer::Signer;
+use std::{sync::Arc, sync::RwLock, time::Instant};
 
 use crate::{
     args::MineArgs,
@@ -268,7 +268,7 @@ fn calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
     1.0 + (balance as f64 / top_balance as f64).min(1.0f64)
 }
 
-fn format_duration(seconds: u32) -> String {
+pub fn format_duration(seconds: u32) -> String {
     let minutes = seconds / 60;
     let remaining_seconds = seconds % 60;
     format!("{:02}:{:02}", minutes, remaining_seconds)

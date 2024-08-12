@@ -1,4 +1,5 @@
-use crate::send_and_confirm::ComputeBudget;
+use crate::mine::format_duration;
+use crate::send_and_confirm::{log_error, ComputeBudget};
 use crate::utils::{get_config, proof_pubkey};
 use crate::Miner;
 use crate::{args::MineDistributedArgs, utils::get_proof_with_authority};
@@ -12,7 +13,7 @@ use solana_rpc_client::spinner;
 use solana_sdk::signer::Signer;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,14 +32,14 @@ struct WorkerResult {
 struct WorkerRequest {
     pub proof: SerializableProof,
     pub cutoff_time: u64,
-    pub thread_offset: u64,
-    pub total_threads: u64,
+    pub core_offset: u64,
+    pub total_cores: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AuthRequest {
     pub pubkey: String,
-    pub thread_count: u64,
+    pub cores_count: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,7 +164,7 @@ impl Miner {
         .unwrap();
         let workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let total_threads: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let total_cores: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
         let signer = self.signer();
 
@@ -174,14 +175,14 @@ impl Miner {
         let worker_handler = Arc::clone(&self);
         let workers_clone = Arc::clone(&workers);
         let result_sender_clone = result_sender.clone();
-        let total_threads_clone = Arc::clone(&total_threads);
+        let total_cores_clone = Arc::clone(&total_cores);
         task::spawn(async move {
             worker_handler
                 .handle_new_connections(
                     listener,
                     workers_clone,
                     result_sender_clone,
-                    total_threads_clone,
+                    total_cores_clone,
                 )
                 .await;
         });
@@ -198,12 +199,14 @@ impl Miner {
         };
 
         loop {
+            let progress_bar = spinner::new_progress_bar();
             // Main mining loop
             let proof = get_proof_with_authority(&self.rpc_client, signer.pubkey()).await;
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
 
             if proof.eq(&previous_proof) {
-                println!("Proof has not changed. Skipping mining...");
+                progress_bar
+                    .finish_with_message(format!("Proof has not changed. Skipping mining..."));
                 sleep(Duration::from_secs(3)).await;
                 continue;
             }
@@ -211,40 +214,40 @@ impl Miner {
             let serializable_proof = SerializableProof::from(&proof);
 
             let mut worker_offsets = Vec::new();
-            let current_total_threads;
+            let current_total_cores;
 
             {
                 let workers_lock = workers.lock().await;
                 let mut offset = 0;
-                for (_, (_, thread_count, _)) in workers_lock.iter() {
+                for (_, (_, cores_count, _)) in workers_lock.iter() {
                     worker_offsets.push(offset);
-                    offset += thread_count;
+                    offset += cores_count;
                 }
-                current_total_threads = *total_threads.lock().await;
+                current_total_cores = *total_cores.lock().await;
             }
 
             let mut offset_index = 0;
-            for (_addr, (tx, _thread_count, offset)) in workers.lock().await.iter_mut() {
+            for (_addr, (tx, _cores_count, offset)) in workers.lock().await.iter_mut() {
                 let request = WorkerRequest {
                     proof: serializable_proof.clone(),
                     cutoff_time,
-                    thread_offset: worker_offsets[offset_index],
-                    total_threads: current_total_threads,
+                    core_offset: worker_offsets[offset_index],
+                    total_cores: current_total_cores,
                 };
                 tx.send(request).await.unwrap();
                 *offset = worker_offsets[offset_index].try_into().unwrap();
                 offset_index += 1;
             }
 
-            println!(
-                "Distributed mining task to {} workers with a total of {} threads",
+            progress_bar.println(format!(
+                "Distributed mining task to {} workers with a total of {} cores",
                 workers.lock().await.len(),
-                current_total_threads
-            );
+                current_total_cores
+            ));
 
             // Wait for cutoff time to end
             let wait_duration = Duration::from_secs(cutoff_time);
-            println!("Waiting for {} seconds...", cutoff_time);
+            progress_bar.println(format!("Waiting for {} seconds...", cutoff_time));
             sleep(wait_duration + Duration::from_secs(3)).await; // Add 3 seconds buffer
 
             // Collect results
@@ -259,10 +262,10 @@ impl Miner {
 
             // Submit best result
             if let Some(result) = best_result {
-                println!(
-                    "Best result received. Best difficulty: {}.Submitting to network...",
+                progress_bar.println(format!(
+                    "Best result received. Best difficulty: {}. Submitting to network...",
                     result.difficulty
-                );
+                ));
                 let config = get_config(&self.rpc_client).await;
                 let solution = result.solution;
                 // Submit solution to the network
@@ -289,12 +292,11 @@ impl Miner {
                 {
                     Ok(_) => {
                         // Save proof to compare with next proof, if it's the same proof, then something wrong with RPC
-                        println!("Solution submitted successfully");
-                        println!("Saving proof to compare with next proof...");
+                        progress_bar.finish_with_message("Solution submitted successfully");
                         previous_proof = proof;
                     }
                     Err(e) => {
-                        println!("Failed to submit solution: {}", e);
+                        log_error(&progress_bar, &e.kind().to_string(), true);
                     }
                 }
             } else {
@@ -307,15 +309,15 @@ impl Miner {
     async fn handle_worker_disconnection(
         addr_str: &str,
         workers: &Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
-        total_threads: &Arc<Mutex<u64>>,
+        total_cores: &Arc<Mutex<u64>>,
     ) {
         let mut workers_lock = workers.lock().await;
-        if let Some((_, thread_count, _)) = workers_lock.remove(addr_str) {
-            let mut total = total_threads.lock().await;
-            *total -= thread_count;
+        if let Some((_, cores_count, _)) = workers_lock.remove(addr_str) {
+            let mut total = total_cores.lock().await;
+            *total -= cores_count;
             println!(
-                "Worker {} disconnected. Removed {} threads. Total threads: {}",
-                addr_str, thread_count, *total
+                "Worker {} disconnected. Removed {} cores. Total cores: {}",
+                addr_str, cores_count, *total
             );
         }
     }
@@ -325,7 +327,7 @@ impl Miner {
         listener: TcpListener,
         workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
         result_sender: mpsc::Sender<WorkerResult>,
-        total_threads: Arc<Mutex<u64>>,
+        total_cores: Arc<Mutex<u64>>,
     ) {
         loop {
             match listener.accept().await {
@@ -334,7 +336,7 @@ impl Miner {
                     println!("New connection from: {}", addr_str);
 
                     // Authenticate worker
-                    let thread_count = match self.authenticate_worker(&mut socket).await {
+                    let cores_count = match self.authenticate_worker(&mut socket).await {
                         Some(count) => count,
                         None => {
                             println!("Authentication failed for worker: {}", addr_str);
@@ -342,25 +344,25 @@ impl Miner {
                         }
                     };
                     println!(
-                        "Worker authenticated: {} with {} threads",
-                        addr_str, thread_count
+                        "Worker authenticated: {} with {} cores",
+                        addr_str, cores_count
                     );
 
                     let (tx, mut rx) = mpsc::channel(10);
                     workers
                         .lock()
                         .await
-                        .insert(addr_str.clone(), (tx, thread_count, 0));
+                        .insert(addr_str.clone(), (tx, cores_count, 0));
 
-                    // Increase total threads
+                    // Increase total cores
                     {
-                        let mut total = total_threads.lock().await;
-                        *total += thread_count;
+                        let mut total = total_cores.lock().await;
+                        *total += cores_count;
                     }
 
                     let workers_clone = Arc::clone(&workers);
                     let result_sender_clone = result_sender.clone();
-                    let total_threads_clone = Arc::clone(&total_threads);
+                    let total_cores_clone = Arc::clone(&total_cores);
 
                     // Spawn a task to handle this worker
                     task::spawn(async move {
@@ -387,11 +389,11 @@ impl Miner {
                                 }
                             }
                         }
-                        // Worker disconnected, remove it and decrease total threads
+                        // Worker disconnected, remove it and decrease total cores
                         Self::handle_worker_disconnection(
                             &addr_str,
                             &workers_clone,
-                            &total_threads_clone,
+                            &total_cores_clone,
                         )
                         .await;
                     });
@@ -406,26 +408,38 @@ impl Miner {
     pub async fn find_hash_par_worker(
         proof: Proof,
         cutoff_time: u64,
-        threads: u64,
+        cores: u64,
         min_difficulty: u32,
-        thread_offset: u64,
-        total_threads: u64,
+        core_offset: u64,
+        total_cores: u64,
     ) -> (Solution, u32) {
-        // Dispatch job to each thread
+        // Dispatch job to each core
         let progress_bar = Arc::new(spinner::new_progress_bar());
+        let global_best_difficulty = Arc::new(RwLock::new(0u32));
         progress_bar.set_message("Mining...");
-        let handles: Vec<_> = (0..threads)
+        let core_ids = core_affinity::get_core_ids().unwrap();
+        let handles: Vec<_> = core_ids
+            .into_iter()
             .map(|i| {
+                let global_best_difficulty = Arc::clone(&global_best_difficulty);
                 std::thread::spawn({
                     let proof = proof.clone();
                     let progress_bar = progress_bar.clone();
                     let mut memory = equix::SolverMemory::new();
                     move || {
+                        // Return if core should not be used
+                        if (i.id as u64).ge(&cores) {
+                            return (0, 0, Hash::default());
+                        }
+
+                        // Pin to core
+                        let _ = core_affinity::set_for_current(i);
+
                         let timer = Instant::now();
-                        let global_thread_id = thread_offset + i;
+                        let global_core_id = core_offset + i.id as u64;
                         let mut nonce = u64::MAX
-                            .saturating_div(total_threads)
-                            .saturating_mul(global_thread_id);
+                            .saturating_div(total_cores)
+                            .saturating_mul(global_core_id);
                         let mut best_nonce = nonce;
                         let mut best_difficulty = 0;
                         let mut best_hash = Hash::default();
@@ -441,20 +455,38 @@ impl Miner {
                                     best_nonce = nonce;
                                     best_difficulty = difficulty;
                                     best_hash = hx;
+                                    // {{ edit_1 }}
+                                    if best_difficulty.gt(&*global_best_difficulty.read().unwrap())
+                                    {
+                                        *global_best_difficulty.write().unwrap() = best_difficulty;
+                                    }
+                                    // {{ edit_1 }}
                                 }
                             }
 
                             // Exit if time has elapsed
                             if nonce % 100 == 0 {
+                                let global_best_difficulty =
+                                    *global_best_difficulty.read().unwrap();
                                 if timer.elapsed().as_secs().ge(&cutoff_time) {
-                                    if best_difficulty.ge(&min_difficulty) {
+                                    if i.id == 0 {
+                                        progress_bar.set_message(format!(
+                                            "Mining... (difficulty {})",
+                                            global_best_difficulty,
+                                        ));
+                                    }
+                                    if global_best_difficulty.ge(&min_difficulty) {
                                         // Mine until min difficulty has been met
                                         break;
                                     }
-                                } else if i == 0 {
+                                } else if i.id == 0 {
                                     progress_bar.set_message(format!(
-                                        "Mining... ({} sec remaining)",
-                                        cutoff_time.saturating_sub(timer.elapsed().as_secs()),
+                                        "Mining... (difficulty {}, time {})",
+                                        global_best_difficulty,
+                                        format_duration(
+                                            cutoff_time.saturating_sub(timer.elapsed().as_secs())
+                                                as u32
+                                        ),
                                     ));
                                 }
                             }
@@ -505,14 +537,14 @@ impl Miner {
         println!("Connected to coordinator");
 
         // Authenticate with the server
-        if !self
-            .authenticate_with_server(&mut stream, args.threads)
-            .await
-        {
+        if !self.authenticate_with_server(&mut stream, args.cores).await {
             println!("Authentication with server failed");
             return;
         }
         println!("Authentication successful");
+
+        // Check num cores
+        self.check_num_cores(args.cores);
 
         loop {
             println!("Waiting for next request from coordinator...");
@@ -528,18 +560,18 @@ impl Miner {
             let config = get_config(&self.rpc_client).await;
 
             println!(
-                "Received new mining request. Cutoff time: {} seconds, Thread offset: {}, Total threads: {}",
-                worker_request.cutoff_time, worker_request.thread_offset, worker_request.total_threads
+                "Received new mining request. Cutoff time: {} seconds, core offset: {}, Total cores: {}",
+                worker_request.cutoff_time, worker_request.core_offset, worker_request.total_cores
             );
 
             // Mine using existing parallel mining code
             let (solution, best_difficulty) = Self::find_hash_par_worker(
                 proof,
                 worker_request.cutoff_time,
-                args.threads,
+                args.cores,
                 config.min_difficulty as u32,
-                worker_request.thread_offset,
-                worker_request.total_threads,
+                worker_request.core_offset,
+                worker_request.total_cores,
             )
             .await;
 
@@ -573,7 +605,7 @@ impl Miner {
 
         println!("Received authentication request from worker");
 
-        let is_authentic = !auth_request.pubkey.is_empty() && auth_request.thread_count > 0;
+        let is_authentic = !auth_request.pubkey.is_empty() && auth_request.cores_count > 0;
 
         let response = AuthResponse {
             success: is_authentic,
@@ -589,16 +621,16 @@ impl Miner {
             .unwrap();
 
         if is_authentic {
-            Some(auth_request.thread_count)
+            Some(auth_request.cores_count)
         } else {
             None
         }
     }
 
-    async fn authenticate_with_server(&self, stream: &mut TcpStream, thread_count: u64) -> bool {
+    async fn authenticate_with_server(&self, stream: &mut TcpStream, cores_count: u64) -> bool {
         let auth_request = AuthRequest {
             pubkey: self.signer().pubkey().to_string(),
-            thread_count,
+            cores_count,
         };
 
         send_message(stream, MessageType::AuthRequest, &auth_request)

@@ -360,7 +360,7 @@ impl Miner {
     }
 }
 
-fn log_error(progress_bar: &ProgressBar, err: &str, finish: bool) {
+pub fn log_error(progress_bar: &ProgressBar, err: &str, finish: bool) {
     if finish {
         progress_bar.finish_with_message(format!("{} {}", "ERROR".bold().red(), err));
     } else {
