@@ -751,7 +751,10 @@ impl Miner {
             )
             .await;
 
-            println!("Mining completed. Best difficulty: {}", best_difficulty);
+            println!(
+                "Mining completed. Best difficulty: {}, total nonces found: {}",
+                best_difficulty, total_nonces
+            );
 
             // Send result back to coordinator
             let result = WorkerResult {
