@@ -145,4 +145,6 @@ pub struct MineDistributedArgs {
 
     #[arg(long, help = "Use hack rpc")]
     pub hack_rpc: bool,
+    #[arg(long, help = "Worker name (required for worker)")]
+    pub worker_name: Option<String>,
 }

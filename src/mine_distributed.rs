@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
 use solana_sdk::signer::Signer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,6 +26,8 @@ use tokio::time::{sleep, Instant};
 struct WorkerResult {
     pub difficulty: u32,
     pub solution: Solution,
+    pub total_hashes: u64,
+    pub worker_addr: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -40,6 +42,7 @@ struct WorkerRequest {
 struct AuthRequest {
     pub pubkey: String,
     pub cores_count: u64,
+    pub worker_name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,6 +62,19 @@ struct SerializableProof {
     pub miner: String,
     pub total_hashes: u64,
     pub total_rewards: u64,
+}
+#[derive(Clone)]
+struct AuthenticatedUser {
+    pub pubkey: Pubkey,
+    pub cores_count: u64,
+    pub worker_name: String,
+}
+
+struct WorkerStats {
+    pub pubkey: Pubkey,
+    pub cores_count: u64,
+    pub worker_name: String,
+    pub hash_power: f64,
 }
 
 impl From<&Proof> for SerializableProof {
@@ -162,9 +178,12 @@ impl Miner {
         ))
         .await
         .unwrap();
-        let workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let workers: Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
         let total_cores: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let global_hash_power: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+        let banned_pubkeys: Arc<Mutex<HashSet<Pubkey>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let signer = self.signer();
 
@@ -176,6 +195,8 @@ impl Miner {
         let workers_clone = Arc::clone(&workers);
         let result_sender_clone = result_sender.clone();
         let total_cores_clone = Arc::clone(&total_cores);
+        let banned_pubkeys_clone = Arc::clone(&banned_pubkeys);
+        let global_hash_power_clone = Arc::clone(&global_hash_power);
         task::spawn(async move {
             worker_handler
                 .handle_new_connections(
@@ -183,6 +204,8 @@ impl Miner {
                     workers_clone,
                     result_sender_clone,
                     total_cores_clone,
+                    banned_pubkeys_clone,
+                    global_hash_power_clone,
                 )
                 .await;
         });
@@ -203,6 +226,8 @@ impl Miner {
             // Main mining loop
             let proof = get_proof_with_authority(&self.rpc_client, signer.pubkey()).await;
             let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
+            // Reset hash power for all workers at the start of each mining session
+            self.reset_hash_powers(&workers).await;
 
             if proof.eq(&previous_proof) {
                 progress_bar
@@ -219,15 +244,15 @@ impl Miner {
             {
                 let workers_lock = workers.lock().await;
                 let mut offset = 0;
-                for (_, (_, cores_count, _)) in workers_lock.iter() {
+                for (_, (_, authenticated_user, _, _)) in workers_lock.iter() {
                     worker_offsets.push(offset);
-                    offset += cores_count;
+                    offset += authenticated_user.cores_count;
                 }
                 current_total_cores = *total_cores.lock().await;
             }
 
             let mut offset_index = 0;
-            for (_addr, (tx, _cores_count, offset)) in workers.lock().await.iter_mut() {
+            for (_addr, (tx, _, offset, _)) in workers.lock().await.iter_mut() {
                 let request = WorkerRequest {
                     proof: serializable_proof.clone(),
                     cutoff_time,
@@ -252,12 +277,36 @@ impl Miner {
 
             // Collect results
             let mut best_result: Option<WorkerResult> = None;
+            let mut dishonest_workers = Vec::new();
             while let Ok(result) = result_receiver.try_recv() {
+                // verify the result difficulty
+                let hash_diff = result.solution.to_hash().difficulty();
+                if hash_diff != result.difficulty {
+                    progress_bar.println(format!(
+                        "Received result with incorrect difficulty from worker {}. Expected: {}, Actual: {}. Worker will be removed.",
+                        result.worker_addr, result.difficulty, hash_diff
+                    ));
+                    dishonest_workers.push(result.worker_addr.clone());
+                    continue;
+                }
                 if best_result.is_none()
                     || result.difficulty > best_result.as_ref().unwrap().difficulty
                 {
                     best_result = Some(result);
                 }
+            }
+
+            self.update_hash_powers(&workers, &global_hash_power, cutoff_time as f64)
+                .await;
+
+            // Calculate and display worker statistics
+            let worker_stats = self.calculate_worker_stats(&workers).await;
+            self.display_worker_stats(&worker_stats, *global_hash_power.lock().await);
+
+            // Remove and ban dishonest workers
+            for worker_addr in dishonest_workers {
+                self.remove_and_ban_worker(&worker_addr, &workers, &total_cores, &banned_pubkeys)
+                    .await;
             }
 
             // Submit best result
@@ -306,18 +355,121 @@ impl Miner {
         }
     }
 
-    async fn handle_worker_disconnection(
-        addr_str: &str,
-        workers: &Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
-        total_cores: &Arc<Mutex<u64>>,
+    async fn reset_hash_powers(
+        &self,
+        workers: &Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
     ) {
         let mut workers_lock = workers.lock().await;
-        if let Some((_, cores_count, _)) = workers_lock.remove(addr_str) {
-            let mut total = total_cores.lock().await;
-            *total -= cores_count;
+        for (_, (_, _, _, hash_power)) in workers_lock.iter_mut() {
+            *hash_power = 0.0;
+        }
+    }
+
+    async fn update_hash_powers(
+        &self,
+        workers: &Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
+        global_hash_power: &Arc<Mutex<f64>>,
+        elapsed_time: f64,
+    ) {
+        let mut workers_lock = workers.lock().await;
+        let mut total_hash_power = 0.0;
+
+        for (_, (_, _, _, hash_power)) in workers_lock.iter_mut() {
+            *hash_power = *hash_power / elapsed_time;
+            total_hash_power += *hash_power;
+        }
+
+        let mut global_power = global_hash_power.lock().await;
+        *global_power = total_hash_power;
+    }
+
+    async fn calculate_worker_stats(
+        &self,
+        workers: &Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
+    ) -> Vec<WorkerStats> {
+        let workers_lock = workers.lock().await;
+        let mut stats: Vec<WorkerStats> = workers_lock
+            .iter()
+            .map(|(_, (_, user, _, hash_power))| WorkerStats {
+                pubkey: user.pubkey,
+                cores_count: user.cores_count,
+                worker_name: user.worker_name.clone(),
+                hash_power: *hash_power,
+            })
+            .collect();
+
+        stats.sort_by(|a, b| b.hash_power.partial_cmp(&a.hash_power).unwrap());
+        stats
+    }
+
+    fn display_worker_stats(&self, stats: &[WorkerStats], global_hash_power: f64) {
+        println!("Global Hash Power: {:.2} H/s", global_hash_power);
+        println!("Worker Statistics:");
+        println!(
+            "| {:<20} | {:<10} | {:<15} | {:<15} |",
+            "Worker Name", "Cores", "Pubkey", "Hash Power (H/s)"
+        );
+        println!("{:-<70}", "");
+        for stat in stats {
             println!(
-                "Worker {} disconnected. Removed {} cores. Total cores: {}",
-                addr_str, cores_count, *total
+                "| {:<20} | {:<10} | {:<15} | {:<15.2} |",
+                stat.worker_name,
+                stat.cores_count,
+                stat.pubkey.to_string()[..15].to_string(),
+                stat.hash_power
+            );
+        }
+        println!();
+    }
+
+    async fn handle_worker_disconnection(
+        addr_str: &str,
+        workers: &Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
+        total_cores: &Arc<Mutex<u64>>,
+        global_hash_power: &Arc<Mutex<f64>>,
+    ) {
+        let mut workers_lock = workers.lock().await;
+        if let Some((_, authenticated_user, _, hash_power)) = workers_lock.remove(addr_str) {
+            let mut total = total_cores.lock().await;
+            *total -= authenticated_user.cores_count;
+            let mut global_power = global_hash_power.lock().await;
+            *global_power -= hash_power;
+            println!(
+                "Worker {} disconnected. Removed {} cores. Total cores: {}, Global Hash Power: {:.2} H/s",
+                authenticated_user.worker_name, authenticated_user.cores_count, *total, *global_power
+            );
+        }
+    }
+
+    async fn remove_and_ban_worker(
+        &self,
+        worker_addr: &str,
+        workers: &Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
+        total_cores: &Arc<Mutex<u64>>,
+        banned_pubkeys: &Arc<Mutex<HashSet<Pubkey>>>,
+    ) {
+        let mut workers_lock = workers.lock().await;
+        if let Some((_, authenticated_user, _, _)) = workers_lock.remove(worker_addr) {
+            let mut total = total_cores.lock().await;
+            *total -= authenticated_user.cores_count;
+
+            // Ban the pubkey
+            let mut banned = banned_pubkeys.lock().await;
+            banned.insert(authenticated_user.pubkey);
+
+            println!(
+                "Dishonest worker {} removed and banned. Pubkey: {}. Subtracted {} cores. Total cores: {}",
+                worker_addr, authenticated_user.pubkey, authenticated_user.cores_count, *total
             );
         }
     }
@@ -325,9 +477,13 @@ impl Miner {
     async fn handle_new_connections(
         self: Arc<Self>,
         listener: TcpListener,
-        workers: Arc<Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, u64, u32)>>>,
+        workers: Arc<
+            Mutex<HashMap<String, (mpsc::Sender<WorkerRequest>, AuthenticatedUser, u32, f64)>>,
+        >,
         result_sender: mpsc::Sender<WorkerResult>,
         total_cores: Arc<Mutex<u64>>,
+        banned_pubkeys: Arc<Mutex<HashSet<Pubkey>>>,
+        global_hash_power: Arc<Mutex<f64>>,
     ) {
         loop {
             match listener.accept().await {
@@ -336,33 +492,35 @@ impl Miner {
                     println!("New connection from: {}", addr_str);
 
                     // Authenticate worker
-                    let cores_count = match self.authenticate_worker(&mut socket).await {
-                        Some(count) => count,
-                        None => {
-                            println!("Authentication failed for worker: {}", addr_str);
-                            continue;
-                        }
-                    };
+                    let authenticated_user =
+                        match self.authenticate_worker(&mut socket, &banned_pubkeys).await {
+                            Some(user) => user,
+                            None => {
+                                println!("Authentication failed for worker: {}", addr_str);
+                                continue;
+                            }
+                        };
                     println!(
                         "Worker authenticated: {} with {} cores",
-                        addr_str, cores_count
+                        addr_str, authenticated_user.cores_count
                     );
 
                     let (tx, mut rx) = mpsc::channel(10);
                     workers
                         .lock()
                         .await
-                        .insert(addr_str.clone(), (tx, cores_count, 0));
+                        .insert(addr_str.clone(), (tx, authenticated_user.clone(), 0, 0.0));
 
                     // Increase total cores
                     {
                         let mut total = total_cores.lock().await;
-                        *total += cores_count;
+                        *total += authenticated_user.cores_count;
                     }
 
                     let workers_clone = Arc::clone(&workers);
                     let result_sender_clone = result_sender.clone();
                     let total_cores_clone = Arc::clone(&total_cores);
+                    let global_hash_power = Arc::clone(&global_hash_power);
 
                     // Spawn a task to handle this worker
                     task::spawn(async move {
@@ -375,9 +533,16 @@ impl Miner {
                                 break;
                             }
 
-                            // Wait for and forward the result
                             match receive_message::<WorkerResult>(&mut socket).await {
-                                Ok(result) => {
+                                Ok(mut result) => {
+                                    result.worker_addr = addr_str.clone();
+                                    // Update worker's hash power for this session
+                                    let mut workers_lock = workers_clone.lock().await;
+                                    if let Some((_, _, _, hash_power)) =
+                                        workers_lock.get_mut(&addr_str)
+                                    {
+                                        *hash_power = result.total_hashes as f64;
+                                    }
                                     result_sender_clone.send(result).await.unwrap();
                                 }
                                 Err(e) => {
@@ -394,6 +559,7 @@ impl Miner {
                             &addr_str,
                             &workers_clone,
                             &total_cores_clone,
+                            &global_hash_power,
                         )
                         .await;
                     });
@@ -412,7 +578,7 @@ impl Miner {
         min_difficulty: u32,
         core_offset: u64,
         total_cores: u64,
-    ) -> (Solution, u32) {
+    ) -> (Solution, u32, u64) {
         // Dispatch job to each core
         let progress_bar = Arc::new(spinner::new_progress_bar());
         let global_best_difficulty = Arc::new(RwLock::new(0u32));
@@ -429,7 +595,7 @@ impl Miner {
                     move || {
                         // Return if core should not be used
                         if (i.id as u64).ge(&cores) {
-                            return (0, 0, Hash::default());
+                            return (0, 0, Hash::default(), 0);
                         }
 
                         // Pin to core
@@ -440,6 +606,7 @@ impl Miner {
                         let mut nonce = u64::MAX
                             .saturating_div(total_cores)
                             .saturating_mul(global_core_id);
+                        let first_nonce = nonce;
                         let mut best_nonce = nonce;
                         let mut best_difficulty = 0;
                         let mut best_hash = Hash::default();
@@ -496,7 +663,7 @@ impl Miner {
                         }
 
                         // Return the best nonce
-                        (best_nonce, best_difficulty, best_hash)
+                        (best_nonce, best_difficulty, best_hash, nonce - first_nonce)
                     }
                 })
             })
@@ -506,12 +673,14 @@ impl Miner {
         let mut best_nonce = 0;
         let mut best_difficulty = 0;
         let mut best_hash = Hash::default();
+        let mut total_nonces = 0;
         for h in handles {
-            if let Ok((nonce, difficulty, hash)) = h.join() {
+            if let Ok((nonce, difficulty, hash, count)) = h.join() {
                 if difficulty > best_difficulty {
                     best_difficulty = difficulty;
                     best_nonce = nonce;
                     best_hash = hash;
+                    total_nonces += count;
                 }
             }
         }
@@ -526,10 +695,14 @@ impl Miner {
         (
             Solution::new(best_hash.d, best_nonce.to_le_bytes()),
             best_difficulty,
+            total_nonces,
         )
     }
 
     async fn work(self: Arc<Self>, args: MineDistributedArgs) {
+        let worker_name = args
+            .worker_name
+            .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000)));
         let mut stream =
             TcpStream::connect(args.coordinator.expect("No coordinator URL specified!"))
                 .await
@@ -537,7 +710,10 @@ impl Miner {
         println!("Connected to coordinator");
 
         // Authenticate with the server
-        if !self.authenticate_with_server(&mut stream, args.cores).await {
+        if !self
+            .authenticate_with_server(&mut stream, args.cores, &worker_name)
+            .await
+        {
             println!("Authentication with server failed");
             return;
         }
@@ -565,7 +741,7 @@ impl Miner {
             );
 
             // Mine using existing parallel mining code
-            let (solution, best_difficulty) = Self::find_hash_par_worker(
+            let (solution, best_difficulty, total_nonces) = Self::find_hash_par_worker(
                 proof,
                 worker_request.cutoff_time,
                 args.cores,
@@ -581,6 +757,8 @@ impl Miner {
             let result = WorkerResult {
                 difficulty: best_difficulty,
                 solution,
+                total_hashes: total_nonces,
+                worker_addr: "".to_string(),
             };
             if let Err(e) = send_message(&mut stream, MessageType::WorkerResult, &result).await {
                 println!("Error sending mining result to coordinator: {}", e);
@@ -590,7 +768,11 @@ impl Miner {
         }
     }
 
-    async fn authenticate_worker(&self, socket: &mut TcpStream) -> Option<u64> {
+    async fn authenticate_worker(
+        &self,
+        socket: &mut TcpStream,
+        banned_pubkeys: &Arc<Mutex<HashSet<Pubkey>>>,
+    ) -> Option<AuthenticatedUser> {
         let auth_request: Result<AuthRequest, std::io::Error> = receive_message(socket).await;
 
         if let Err(e) = auth_request {
@@ -605,8 +787,21 @@ impl Miner {
 
         println!("Received authentication request from worker");
 
-        let is_authentic = !auth_request.pubkey.is_empty() && auth_request.cores_count > 0;
+        let pubkey = Pubkey::from_str(&auth_request.pubkey).ok()?;
 
+        // Check if the pubkey is banned
+        if banned_pubkeys.lock().await.contains(&pubkey) {
+            let response = AuthResponse {
+                success: false,
+                message: "Authentication failed: Pubkey is banned".to_string(),
+            };
+            send_message(socket, MessageType::AuthResponse, &response)
+                .await
+                .unwrap();
+            return None;
+        }
+
+        let is_authentic = !auth_request.pubkey.is_empty() && auth_request.cores_count > 0;
         let response = AuthResponse {
             success: is_authentic,
             message: if is_authentic {
@@ -621,16 +816,26 @@ impl Miner {
             .unwrap();
 
         if is_authentic {
-            Some(auth_request.cores_count)
+            Some(AuthenticatedUser {
+                pubkey,
+                cores_count: auth_request.cores_count,
+                worker_name: auth_request.worker_name,
+            })
         } else {
             None
         }
     }
 
-    async fn authenticate_with_server(&self, stream: &mut TcpStream, cores_count: u64) -> bool {
+    async fn authenticate_with_server(
+        &self,
+        stream: &mut TcpStream,
+        cores_count: u64,
+        worker_name: &str,
+    ) -> bool {
         let auth_request = AuthRequest {
             pubkey: self.signer().pubkey().to_string(),
             cores_count,
+            worker_name: worker_name.to_string(),
         };
 
         send_message(stream, MessageType::AuthRequest, &auth_request)
