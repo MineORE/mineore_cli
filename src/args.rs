@@ -119,12 +119,8 @@ pub struct UpgradeArgs {
 
 #[derive(Parser, Debug)]
 pub struct MineDistributedArgs {
-    #[arg(long, help = "Role: 'coordinator' or 'worker'")]
-    pub role: String,
-    #[arg(long, help = "Coordinator address (required for worker)")]
-    pub coordinator: Option<String>,
-    #[arg(long, help = "Coordinator port (required for coordinator)")]
-    pub coordinator_port: Option<String>,
+    #[arg(long, help = "Pool URL (required for worker)")]
+    pub pool: Option<String>,
     #[arg(
         long,
         short,
@@ -133,7 +129,6 @@ pub struct MineDistributedArgs {
         default_value = "1"
     )]
     pub cores: u64,
-
     #[arg(
         long,
         short,
@@ -142,9 +137,6 @@ pub struct MineDistributedArgs {
         default_value = "5"
     )]
     pub buffer_time: u64,
-
-    #[arg(long, help = "Use hack rpc")]
-    pub hack_rpc: bool,
     #[arg(long, help = "Worker name (required for worker)")]
     pub worker_name: Option<String>,
 }

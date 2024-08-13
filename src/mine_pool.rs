@@ -132,10 +132,9 @@ impl Miner {
         let worker_name = args
             .worker_name
             .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000000)));
-        let mut stream =
-            TcpStream::connect(args.coordinator.expect("No coordinator URL specified!"))
-                .await
-                .unwrap();
+        let mut stream = TcpStream::connect(args.pool.expect("No coordinator URL specified!"))
+            .await
+            .unwrap();
         println!("Connected to coordinator");
 
         // Authenticate with the server
