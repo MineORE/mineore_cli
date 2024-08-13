@@ -10,7 +10,7 @@ mod dynamic_fee;
 #[cfg(feature = "admin")]
 mod initialize;
 mod mine;
-mod mine_distributed;
+mod mine_pool;
 mod open;
 mod proof;
 mod rewards;
@@ -20,8 +20,8 @@ mod transfer;
 mod upgrade;
 mod utils;
 
-use std::{sync::Arc, sync::RwLock};
 use futures::StreamExt;
+use std::{sync::Arc, sync::RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -149,7 +149,7 @@ struct Args {
 
     #[arg(
         long,
-        value_name = "JITO", 
+        value_name = "JITO",
         help = "Add jito tip to the miner. Defaults to false.",
         global = true
     )]
@@ -197,15 +197,14 @@ async fn main() {
                     if let Ok(tips) = serde_json::from_str::<Vec<Tip>>(&text) {
                         for item in tips {
                             let mut tip = tip_clone.write().unwrap();
-                            *tip =
-                                (item.landed_tips_50th_percentile * (10_f64).powf(9.0)) as u64;
+                            *tip = (item.landed_tips_50th_percentile * (10_f64).powf(9.0)) as u64;
                         }
                     }
                 }
             }
         });
     }
-    
+
     let miner = Arc::new(Miner::new(
         Arc::new(rpc_client),
         args.priority_fee,
@@ -260,7 +259,7 @@ async fn main() {
             miner.initialize().await;
         }
         Commands::MineDistributed(args) => {
-            miner.mine_distributed(args).await;
+            miner.work(args).await;
         }
     }
 }
