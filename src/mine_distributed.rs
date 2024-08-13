@@ -603,10 +603,10 @@ impl Miner {
 
                         let timer = Instant::now();
                         let global_core_id = core_offset + i.id as u64;
-                        let mut nonce = u64::MAX
+                        let first_nonce = u64::MAX
                             .saturating_div(total_cores)
                             .saturating_mul(global_core_id);
-                        let first_nonce = nonce;
+                        let mut nonce = first_nonce;
                         let mut best_nonce = nonce;
                         let mut best_difficulty = 0;
                         let mut best_hash = Hash::default();
@@ -680,8 +680,8 @@ impl Miner {
                     best_difficulty = difficulty;
                     best_nonce = nonce;
                     best_hash = hash;
-                    total_nonces += count;
                 }
+                total_nonces += count;
             }
         }
 
