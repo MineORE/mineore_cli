@@ -1,6 +1,6 @@
 use crate::args::MineDistributedArgs;
 use crate::mine::format_duration;
-use crate::utils::get_config;
+use crate::utils::{get_config, log_error, log_info};
 use crate::Miner;
 use drillx::{equix, Hash, Solution};
 use ore_api::state::Proof;
@@ -228,6 +228,12 @@ impl Miner {
         println!("Sent authentication request to server");
 
         let auth_response: AuthResponse = receive_message(stream).await.unwrap();
+
+        if !auth_response.success {
+            log_error(&auth_response.message, false);
+        } else {
+            log_info(&auth_response.message);
+        }
 
         auth_response.success
     }

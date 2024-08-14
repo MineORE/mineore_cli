@@ -1,4 +1,5 @@
 use cached::proc_macro::cached;
+use colored::Colorize;
 use ore_api::{
     consts::{CONFIG_ADDRESS, MINT_ADDRESS, PROOF, TOKEN_DECIMALS, TREASURY_ADDRESS},
     state::{Config, Proof, Treasury},
@@ -65,4 +66,19 @@ pub struct Tip {
     pub landed_tips_95th_percentile: f64,
     pub landed_tips_99th_percentile: f64,
     pub ema_landed_tips_50th_percentile: f64,
+}
+
+pub fn log_error(error_message: &str, is_fatal: bool) {
+    let formatted_message = if is_fatal {
+        format!("FATAL ERROR: {}", error_message).red().bold()
+    } else {
+        format!("ERROR: {}", error_message).red().bold()
+    };
+
+    eprintln!("{}", formatted_message);
+}
+
+pub fn log_info(message: &str) {
+    let formatted_message = format!("INFO: {}", message).cyan().bold();
+    println!("{}", formatted_message);
 }
