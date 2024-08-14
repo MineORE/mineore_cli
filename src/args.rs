@@ -1,13 +1,7 @@
 use clap::{arg, Parser};
 
 #[derive(Parser, Debug)]
-pub struct BalanceArgs {
-    #[arg(
-        value_name = "ADDRESS",
-        help = "The account address to fetch the balance of."
-    )]
-    pub address: Option<String>,
-}
+pub struct BalanceArgs {}
 
 #[derive(Parser, Debug)]
 pub struct BenchmarkArgs {
@@ -25,20 +19,7 @@ pub struct BenchmarkArgs {
 pub struct BussesArgs {}
 
 #[derive(Parser, Debug)]
-pub struct ClaimArgs {
-    #[arg(
-        value_name = "AMOUNT",
-        help = "The amount of rewards to claim. Defaults to max."
-    )]
-    pub amount: Option<f64>,
-
-    #[arg(
-        long,
-        value_name = "WALLET_ADDRESS",
-        help = "Wallet address to receive claimed tokens."
-    )]
-    pub to: Option<String>,
-}
+pub struct ClaimArgs {}
 
 #[derive(Parser, Debug)]
 pub struct CloseArgs {}

@@ -9,7 +9,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
-use solana_sdk::signer::Signer;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,7 +131,7 @@ impl Miner {
         let worker_name = args
             .worker_name
             .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000000)));
-        let mut stream = TcpStream::connect(args.pool.expect("No coordinator URL specified!"))
+        let mut stream = TcpStream::connect(args.pool.expect("No Pool URL specified!"))
             .await
             .unwrap();
         println!("Connected to coordinator");
@@ -205,8 +204,15 @@ impl Miner {
         cores_count: u64,
         worker_name: &str,
     ) -> bool {
+        let self_address = match self.address {
+            Some(ref address) => address,
+            None => {
+                println!("No miner address specified");
+                return false;
+            }
+        };
         let auth_request = AuthRequest {
-            pubkey: self.signer().pubkey().to_string(),
+            pubkey: self_address.to_string(),
             cores_count,
             worker_name: worker_name.to_string(),
         };

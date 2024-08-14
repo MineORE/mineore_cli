@@ -3,96 +3,13 @@ use drillx::{
     equix::{self},
     Hash, Solution,
 };
-use ore_api::{
-    consts::{BUS_ADDRESSES, BUS_COUNT, EPOCH_DURATION},
-    state::{Bus, Config, Proof},
-};
-use ore_utils::AccountDeserialize;
-use rand::Rng;
-use solana_program::pubkey::Pubkey;
+use ore_api::state::Proof;
 use solana_rpc_client::spinner;
-use solana_sdk::signer::Signer;
 use std::{sync::Arc, sync::RwLock, time::Instant};
 
-use crate::{
-    args::MineArgs,
-    send_and_confirm::ComputeBudget,
-    utils::{
-        amount_u64_to_string, get_clock, get_config, get_updated_proof_with_authority, proof_pubkey,
-    },
-    Miner,
-};
+use crate::Miner;
 
 impl Miner {
-    pub async fn mine(&self, args: MineArgs) {
-        // Open account, if needed.
-        let signer = self.signer();
-        self.open().await;
-
-        // Check num threads
-        self.check_num_cores(args.cores);
-
-        // Start mining loop
-        let mut last_hash_at = 0;
-        let mut last_balance = 0;
-        loop {
-            // Fetch proof
-            let config = get_config(&self.rpc_client).await;
-            let proof =
-                get_updated_proof_with_authority(&self.rpc_client, signer.pubkey(), last_hash_at)
-                    .await;
-            println!(
-                "\n\nStake: {} ORE\n{}  Multiplier: {:12}x",
-                amount_u64_to_string(proof.balance),
-                if last_hash_at.gt(&0) {
-                    format!(
-                        "  Change: {} ORE\n",
-                        amount_u64_to_string(proof.balance.saturating_sub(last_balance))
-                    )
-                } else {
-                    "".to_string()
-                },
-                calculate_multiplier(proof.balance, config.top_balance)
-            );
-            last_hash_at = proof.last_hash_at;
-            last_balance = proof.balance;
-
-            // Calculate cutoff time
-            let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
-
-            println!(
-                "Mining for {} seconds (buffer: {} sec)",
-                cutoff_time, args.buffer_time
-            );
-
-            // Run drillx
-            let solution =
-                Self::find_hash_par(proof, cutoff_time, args.cores, config.min_difficulty as u32)
-                    .await;
-
-            // Build instruction set
-            let mut ixs = vec![ore_api::instruction::auth(proof_pubkey(signer.pubkey()))];
-            let mut compute_budget = 500_000;
-            if self.should_reset(config).await && rand::thread_rng().gen_range(0..100).eq(&0) {
-                compute_budget += 100_000;
-                ixs.push(ore_api::instruction::reset(signer.pubkey()));
-            }
-
-            // Build mine ix
-            ixs.push(ore_api::instruction::mine(
-                signer.pubkey(),
-                signer.pubkey(),
-                self.find_bus().await,
-                solution,
-            ));
-
-            // Submit transaction
-            self.send_and_confirm(&ixs, ComputeBudget::Fixed(compute_budget), false, 0)
-                .await
-                .ok();
-        }
-    }
-
     pub async fn find_hash_par(
         proof: Proof,
         cutoff_time: u64,
@@ -219,48 +136,6 @@ impl Miner {
                 num_cores
             );
         }
-    }
-
-    pub async fn should_reset(&self, config: Config) -> bool {
-        let clock = get_clock(&self.rpc_client).await;
-        config
-            .last_reset_at
-            .saturating_add(EPOCH_DURATION)
-            .saturating_sub(5) // Buffer
-            .le(&clock.unix_timestamp)
-    }
-
-    pub async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
-        let clock = get_clock(&self.rpc_client).await;
-        proof
-            .last_hash_at
-            .saturating_add(60)
-            .saturating_sub(buffer_time as i64)
-            .saturating_sub(clock.unix_timestamp)
-            .max(0) as u64
-    }
-
-    pub async fn find_bus(&self) -> Pubkey {
-        // Fetch the bus with the largest balance
-        if let Ok(accounts) = self.rpc_client.get_multiple_accounts(&BUS_ADDRESSES).await {
-            let mut top_bus_balance: u64 = 0;
-            let mut top_bus = BUS_ADDRESSES[0];
-            for account in accounts {
-                if let Some(account) = account {
-                    if let Ok(bus) = Bus::try_from_bytes(&account.data) {
-                        if bus.rewards.gt(&top_bus_balance) {
-                            top_bus_balance = bus.rewards;
-                            top_bus = BUS_ADDRESSES[bus.id as usize];
-                        }
-                    }
-                }
-            }
-            return top_bus;
-        }
-
-        // Otherwise return a random bus
-        let i = rand::thread_rng().gen_range(0..BUS_COUNT);
-        BUS_ADDRESSES[i]
     }
 }
 

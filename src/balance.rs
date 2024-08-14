@@ -1,7 +1,6 @@
 use std::str::FromStr;
 
 use solana_program::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
 
 use crate::{
     args::BalanceArgs,
@@ -10,17 +9,10 @@ use crate::{
 };
 
 impl Miner {
-    pub async fn balance(&self, args: BalanceArgs) {
-        let signer = self.signer();
-        let address = if let Some(address) = args.address {
-            if let Ok(address) = Pubkey::from_str(&address) {
-                address
-            } else {
-                println!("Invalid address: {:?}", address);
-                return;
-            }
-        } else {
-            signer.pubkey()
+    pub async fn balance(&self, _args: BalanceArgs) {
+        let address = match self.address {
+            Some(ref address) => Pubkey::from_str(address).expect("Failed to parse address"),
+            None => Err("No address provided").expect("Failed to parse address"),
         };
         let proof = get_proof_with_authority(&self.rpc_client, address).await;
         let token_account_address = spl_associated_token_account::get_associated_token_address(
