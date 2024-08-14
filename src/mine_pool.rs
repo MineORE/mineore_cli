@@ -36,6 +36,7 @@ struct AuthRequest {
     pub pubkey: String,
     pub cores_count: u64,
     pub worker_name: String,
+    pub invitation_code: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,9 +137,10 @@ impl Miner {
             .unwrap();
         println!("Connected to coordinator");
 
+        let invitation_code = args.invitation_code.unwrap_or("123456".to_string());
         // Authenticate with the server
         if !self
-            .authenticate_with_server(&mut stream, args.cores, &worker_name)
+            .authenticate_with_server(&mut stream, args.cores, &worker_name, &invitation_code)
             .await
         {
             println!("Authentication with server failed");
@@ -203,6 +205,7 @@ impl Miner {
         stream: &mut TcpStream,
         cores_count: u64,
         worker_name: &str,
+        invitation_code: &str,
     ) -> bool {
         let self_address = match self.address {
             Some(ref address) => address,
@@ -215,6 +218,7 @@ impl Miner {
             pubkey: self_address.to_string(),
             cores_count,
             worker_name: worker_name.to_string(),
+            invitation_code: invitation_code.to_string(),
         };
 
         send_message(stream, MessageType::AuthRequest, &auth_request)

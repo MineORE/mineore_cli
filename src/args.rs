@@ -120,4 +120,7 @@ pub struct MineDistributedArgs {
     pub buffer_time: u64,
     #[arg(long, help = "Worker name (required for worker)")]
     pub worker_name: Option<String>,
+
+    #[arg(long, help = "Invitation code (optional)")]
+    pub invitation_code: Option<String>,
 }
