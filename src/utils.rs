@@ -57,17 +57,6 @@ pub fn treasury_tokens_pubkey() -> Pubkey {
     get_associated_token_address(&TREASURY_ADDRESS, &MINT_ADDRESS)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Tip {
-    pub time: String,
-    pub landed_tips_25th_percentile: f64,
-    pub landed_tips_50th_percentile: f64,
-    pub landed_tips_75th_percentile: f64,
-    pub landed_tips_95th_percentile: f64,
-    pub landed_tips_99th_percentile: f64,
-    pub ema_landed_tips_50th_percentile: f64,
-}
-
 pub fn log_error(error_message: &str, is_fatal: bool) {
     let formatted_message = if is_fatal {
         format!("FATAL ERROR: {}", error_message).red().bold()

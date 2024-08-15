@@ -9,10 +9,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
+use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Instant;
 
 #[derive(Serialize, Deserialize)]
@@ -21,14 +24,16 @@ struct WorkerResult {
     pub solution: Solution,
     pub total_hashes: u64,
     pub worker_addr: String,
+    pub round_id: i32,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct WorkerRequest {
     pub proof: SerializableProof,
     pub cutoff_time: u64,
     pub core_offset: u64,
     pub total_cores: u64,
+    pub round_id: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,7 +50,14 @@ struct AuthResponse {
     pub message: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
+struct StatusMessage {
+    pending_reward: f64,
+    estimated_reward_per_hour: f64,
+    average_hash_rate: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct SerializableProof {
     pub authority: String,
     pub balance: u64,
@@ -64,12 +76,26 @@ enum MessageType {
     AuthResponse,
     WorkerRequest,
     WorkerResult,
+    StopMiningImmediately,
+    StatusMessage,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct MessageHeader {
     message_type: MessageType,
     payload_size: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum ServerMessage {
+    WorkerRequest(WorkerRequest),
+    StopMiningImmediately,
+    StatusMessage(StatusMessage),
+}
+
+#[derive(Serialize, Deserialize)]
+enum WorkerMessage {
+    WorkerResult(WorkerResult),
 }
 
 impl SerializableProof {
@@ -89,10 +115,11 @@ impl SerializableProof {
 }
 
 async fn send_message<T: Serialize>(
-    stream: &mut TcpStream,
+    write_half: &Arc<Mutex<OwnedWriteHalf>>,
     message_type: MessageType,
     payload: &T,
 ) -> std::io::Result<()> {
+    let mut write_guard = write_half.lock().await;
     let payload_bytes = bincode::serialize(payload).unwrap();
     let header = MessageHeader {
         message_type,
@@ -100,31 +127,76 @@ async fn send_message<T: Serialize>(
     };
     let header_bytes = bincode::serialize(&header).unwrap();
 
-    stream
+    write_guard
         .write_all(&(header_bytes.len() as u32).to_be_bytes())
         .await?;
-    stream.write_all(&header_bytes).await?;
-    stream.write_all(&payload_bytes).await?;
-    stream.flush().await?;
+    write_guard.write_all(&header_bytes).await?;
+    write_guard.write_all(&payload_bytes).await?;
+    write_guard.flush().await?;
 
     Ok(())
 }
 
-async fn receive_message<T: DeserializeOwned>(stream: &mut TcpStream) -> std::io::Result<T> {
+async fn receive_message<T: DeserializeOwned>(
+    read_half: &Arc<Mutex<OwnedReadHalf>>,
+) -> std::io::Result<T> {
+    let mut read_guard = read_half.lock().await;
     let mut header_size_bytes = [0u8; 4];
-    stream.read_exact(&mut header_size_bytes).await?;
+    read_guard.read_exact(&mut header_size_bytes).await?;
     let header_size = u32::from_be_bytes(header_size_bytes) as usize;
 
+    debug_hex_print("Header size", &header_size_bytes);
+
     let mut header_bytes = vec![0u8; header_size];
-    stream.read_exact(&mut header_bytes).await?;
+    read_guard.read_exact(&mut header_bytes).await?;
     let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
 
+    debug_hex_print("Header", &header_bytes);
+
     let mut payload_bytes = vec![0u8; header.payload_size as usize];
-    stream.read_exact(&mut payload_bytes).await?;
+    read_guard.read_exact(&mut payload_bytes).await?;
+
+    debug_hex_print("Payload", &payload_bytes);
 
     let payload: T = bincode::deserialize(&payload_bytes).unwrap();
 
     Ok(payload)
+}
+
+fn debug_hex_print(label: &str, bytes: &[u8]) {
+    const BYTES_PER_LINE: usize = 16;
+    println!("{}:", label);
+    println!("Length: {} bytes", bytes.len());
+    println!("Hex dump:");
+
+    for (i, chunk) in bytes.chunks(BYTES_PER_LINE).enumerate() {
+        let mut hex_line = String::new();
+        let mut ascii_line = String::new();
+
+        for &byte in chunk {
+            write!(&mut hex_line, "{:02X} ", byte).unwrap();
+            ascii_line.push(if byte.is_ascii_graphic() {
+                byte as char
+            } else {
+                '.'
+            });
+        }
+
+        // Pad the hex line if it's shorter than BYTES_PER_LINE
+        if chunk.len() < BYTES_PER_LINE {
+            for _ in 0..(BYTES_PER_LINE - chunk.len()) {
+                hex_line.push_str("   ");
+            }
+        }
+
+        println!(
+            "{:04X}: {:48} |{}|",
+            i * BYTES_PER_LINE,
+            hex_line,
+            ascii_line
+        );
+    }
+    println!();
 }
 
 impl Miner {
@@ -132,15 +204,25 @@ impl Miner {
         let worker_name = args
             .worker_name
             .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000000)));
-        let mut stream = TcpStream::connect(args.pool.expect("No Pool URL specified!"))
+        let stream = TcpStream::connect(args.pool.expect("No Pool URL specified!"))
             .await
             .unwrap();
         println!("Connected to coordinator");
 
+        let (read_half, write_half) = stream.into_split();
+        let read_half = Arc::new(Mutex::new(read_half));
+        let write_half = Arc::new(Mutex::new(write_half));
+
         let invitation_code = args.invitation_code.unwrap_or("123456".to_string());
         // Authenticate with the server
         if !self
-            .authenticate_with_server(&mut stream, args.cores, &worker_name, &invitation_code)
+            .authenticate_with_server(
+                Arc::clone(&read_half),
+                Arc::clone(&write_half),
+                args.cores,
+                &worker_name,
+                &invitation_code,
+            )
             .await
         {
             println!("Authentication with server failed");
@@ -151,58 +233,126 @@ impl Miner {
         // Check num cores
         self.check_num_cores(args.cores);
 
+        // Create a channel for server messages
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(100);
+
+        // Spawn a task to handle incoming messages
+        let read_half_clone = Arc::clone(&read_half);
+        tokio::spawn(async move {
+            Self::handle_server_messages(read_half_clone, tx).await;
+        });
+
+        let mut current_mining_task: Option<tokio::task::JoinHandle<()>> = None;
+
         loop {
-            println!("Waiting for next request from coordinator...");
-            // Receive proof from coordinator
-            let worker_request: WorkerRequest = match receive_message(&mut stream).await {
-                Ok(request) => request,
+            tokio::select! {
+                Some(message) = rx.recv() => {
+                    match message {
+                        ServerMessage::WorkerRequest(worker_request) => {
+                            println!(
+                                "Received new mining request. Cutoff time: {} seconds, core offset: {}, Total cores: {}",
+                                worker_request.cutoff_time, worker_request.core_offset, worker_request.total_cores
+                            );
+
+                            // If there's an ongoing mining task, cancel it
+                            if let Some(task) = current_mining_task.take() {
+                                task.abort();
+                            }
+
+                            // Start a new mining task
+                            let miner = Arc::clone(&self);
+                            let write_half = Arc::clone(&write_half);
+                            current_mining_task = Some(tokio::spawn(async move {
+                                let result = Self::perform_mining(miner, worker_request, args.cores).await;
+                                if let Err(e) = send_message(&write_half, MessageType::WorkerResult, &WorkerMessage::WorkerResult(result)).await {
+                                    println!("Error sending mining result to coordinator: {}", e);
+                                }
+                                println!("Sent mining result to coordinator");
+                            }));
+                        },
+                        ServerMessage::StopMiningImmediately => {
+                            println!("Received stop mining command. Stopping mining process.");
+                            if let Some(task) = current_mining_task.take() {
+                                task.abort();
+                            }
+                        },
+                        ServerMessage::StatusMessage(status) => {
+                            println!("Received status update:");
+                            println!("Pending reward: {} ORE", status.pending_reward);
+                            println!("Estimated reward per hour: {} ORE", status.estimated_reward_per_hour);
+                            println!("Average hash rate: {} H/s", status.average_hash_rate);
+                        },
+                    }
+                },
+                else => break,
+            }
+        }
+    }
+
+    async fn handle_server_messages(
+        read_half: Arc<Mutex<OwnedReadHalf>>,
+        tx: mpsc::Sender<ServerMessage>,
+    ) {
+        loop {
+            match receive_message::<ServerMessage>(&read_half).await {
+                Ok(message_type) => match message_type {
+                    ServerMessage::WorkerRequest(request) => {
+                        tx.send(ServerMessage::WorkerRequest(request))
+                            .await
+                            .unwrap();
+                    }
+                    ServerMessage::StopMiningImmediately => {
+                        tx.send(ServerMessage::StopMiningImmediately).await.unwrap();
+                    }
+                    ServerMessage::StatusMessage(status) => {
+                        tx.send(ServerMessage::StatusMessage(status)).await.unwrap();
+                    }
+                    _ => println!("Received unexpected message type"),
+                },
                 Err(e) => {
-                    println!("Error receiving worker request: {}", e);
+                    println!("Error receiving message from server: {}", e);
                     break;
                 }
-            };
-            let proof = worker_request.proof.to_proof();
-            let config = get_config(&self.rpc_client).await;
-
-            println!(
-                "Received new mining request. Cutoff time: {} seconds, core offset: {}, Total cores: {}",
-                worker_request.cutoff_time, worker_request.core_offset, worker_request.total_cores
-            );
-
-            // Mine using existing parallel mining code
-            let (solution, best_difficulty, total_nonces) = Self::find_hash_par_worker(
-                proof,
-                worker_request.cutoff_time,
-                args.cores,
-                config.min_difficulty as u32,
-                worker_request.core_offset,
-                worker_request.total_cores,
-            )
-            .await;
-
-            println!(
-                "Mining completed. Best difficulty: {}, total nonces found: {}",
-                best_difficulty, total_nonces
-            );
-
-            // Send result back to coordinator
-            let result = WorkerResult {
-                difficulty: best_difficulty,
-                solution,
-                total_hashes: total_nonces,
-                worker_addr: "".to_string(),
-            };
-            if let Err(e) = send_message(&mut stream, MessageType::WorkerResult, &result).await {
-                println!("Error sending mining result to coordinator: {}", e);
-                break;
             }
-            println!("Sent mining result to coordinator");
+        }
+    }
+
+    async fn perform_mining(
+        self: Arc<Self>,
+        worker_request: WorkerRequest,
+        cores: u64,
+    ) -> WorkerResult {
+        let proof = worker_request.proof.to_proof();
+        let config = get_config(&self.rpc_client).await;
+
+        let (solution, best_difficulty, total_nonces) = Self::find_hash_par_worker(
+            proof,
+            worker_request.cutoff_time,
+            cores,
+            config.min_difficulty as u32,
+            worker_request.core_offset,
+            worker_request.total_cores,
+        )
+        .await;
+
+        println!(
+            "Mining completed. Best difficulty: {}, total nonces found: {}",
+            best_difficulty, total_nonces
+        );
+
+        WorkerResult {
+            difficulty: best_difficulty,
+            solution,
+            total_hashes: total_nonces,
+            worker_addr: "".to_string(),
+            round_id: worker_request.round_id,
         }
     }
 
     async fn authenticate_with_server(
         &self,
-        stream: &mut TcpStream,
+        read_half: Arc<Mutex<OwnedReadHalf>>,
+        write_half: Arc<Mutex<OwnedWriteHalf>>,
         cores_count: u64,
         worker_name: &str,
         invitation_code: &str,
@@ -221,13 +371,13 @@ impl Miner {
             invitation_code: invitation_code.to_string(),
         };
 
-        send_message(stream, MessageType::AuthRequest, &auth_request)
+        send_message(&write_half, MessageType::AuthRequest, &auth_request)
             .await
             .unwrap();
 
         println!("Sent authentication request to server");
 
-        let auth_response: AuthResponse = receive_message(stream).await.unwrap();
+        let auth_response: AuthResponse = receive_message(&read_half).await.unwrap();
 
         if !auth_response.success {
             log_error(&auth_response.message, false);
