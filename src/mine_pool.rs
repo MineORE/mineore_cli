@@ -3,19 +3,16 @@ use crate::mine::format_duration;
 use crate::utils::{get_config, log_error, log_info};
 use crate::Miner;
 use drillx::{equix, Hash, Solution};
-use ore_api::state::Proof;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use solana_program::pubkey::Pubkey;
 use solana_rpc_client::spinner;
 use std::fmt::Write;
-use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 
 #[derive(Serialize, Deserialize)]
@@ -29,7 +26,7 @@ struct WorkerResult {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct WorkerRequest {
-    pub proof: SerializableProof,
+    pub challenge: [u8; 32],
     pub cutoff_time: u64,
     pub core_offset: u64,
     pub total_cores: u64,
@@ -57,72 +54,36 @@ struct StatusMessage {
     average_hash_rate: f64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct SerializableProof {
-    pub authority: String,
-    pub balance: u64,
-    pub challenge: [u8; 32],
-    pub last_hash: [u8; 32],
-    pub last_hash_at: i64,
-    pub last_stake_at: i64,
-    pub miner: String,
-    pub total_hashes: u64,
-    pub total_rewards: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum MessageType {
-    AuthRequest,
-    AuthResponse,
-    WorkerRequest,
-    WorkerResult,
-    StopMiningImmediately,
-    StatusMessage,
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 struct MessageHeader {
-    message_type: MessageType,
     payload_size: u32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 enum ServerMessage {
     WorkerRequest(WorkerRequest),
     StopMiningImmediately,
     StatusMessage(StatusMessage),
+    AuthResponse(AuthResponse),
 }
 
 #[derive(Serialize, Deserialize)]
 enum WorkerMessage {
     WorkerResult(WorkerResult),
+    AuthRequest(AuthRequest),
 }
 
-impl SerializableProof {
-    fn to_proof(&self) -> Proof {
-        Proof {
-            authority: Pubkey::from_str(&self.authority).unwrap(),
-            balance: self.balance,
-            challenge: self.challenge,
-            last_hash: self.last_hash,
-            last_hash_at: self.last_hash_at,
-            last_stake_at: self.last_stake_at,
-            miner: Pubkey::from_str(&self.miner).unwrap(),
-            total_hashes: self.total_hashes,
-            total_rewards: self.total_rewards,
-        }
-    }
-}
-
+/**
+ * Packet visualization:
+ * | Header size (4 bytes) | Header | Payload |
+ */
 async fn send_message<T: Serialize>(
     write_half: &Arc<Mutex<OwnedWriteHalf>>,
-    message_type: MessageType,
     payload: &T,
 ) -> std::io::Result<()> {
     let mut write_guard = write_half.lock().await;
     let payload_bytes = bincode::serialize(payload).unwrap();
     let header = MessageHeader {
-        message_type,
         payload_size: payload_bytes.len() as u32,
     };
     let header_bytes = bincode::serialize(&header).unwrap();
@@ -145,18 +106,12 @@ async fn receive_message<T: DeserializeOwned>(
     read_guard.read_exact(&mut header_size_bytes).await?;
     let header_size = u32::from_be_bytes(header_size_bytes) as usize;
 
-    debug_hex_print("Header size", &header_size_bytes);
-
     let mut header_bytes = vec![0u8; header_size];
     read_guard.read_exact(&mut header_bytes).await?;
     let header: MessageHeader = bincode::deserialize(&header_bytes).unwrap();
 
-    debug_hex_print("Header", &header_bytes);
-
     let mut payload_bytes = vec![0u8; header.payload_size as usize];
     read_guard.read_exact(&mut payload_bytes).await?;
-
-    debug_hex_print("Payload", &payload_bytes);
 
     let payload: T = bincode::deserialize(&payload_bytes).unwrap();
 
@@ -264,7 +219,7 @@ impl Miner {
                             let write_half = Arc::clone(&write_half);
                             current_mining_task = Some(tokio::spawn(async move {
                                 let result = Self::perform_mining(miner, worker_request, args.cores).await;
-                                if let Err(e) = send_message(&write_half, MessageType::WorkerResult, &WorkerMessage::WorkerResult(result)).await {
+                                if let Err(e) = send_message(&write_half, &WorkerMessage::WorkerResult(result)).await {
                                     println!("Error sending mining result to coordinator: {}", e);
                                 }
                                 println!("Sent mining result to coordinator");
@@ -282,6 +237,7 @@ impl Miner {
                             println!("Estimated reward per hour: {} ORE", status.estimated_reward_per_hour);
                             println!("Average hash rate: {} H/s", status.average_hash_rate);
                         },
+                        _ => {},
                     }
                 },
                 else => break,
@@ -307,7 +263,7 @@ impl Miner {
                     ServerMessage::StatusMessage(status) => {
                         tx.send(ServerMessage::StatusMessage(status)).await.unwrap();
                     }
-                    _ => println!("Received unexpected message type"),
+                    _ => {}
                 },
                 Err(e) => {
                     println!("Error receiving message from server: {}", e);
@@ -322,11 +278,10 @@ impl Miner {
         worker_request: WorkerRequest,
         cores: u64,
     ) -> WorkerResult {
-        let proof = worker_request.proof.to_proof();
         let config = get_config(&self.rpc_client).await;
 
         let (solution, best_difficulty, total_nonces) = Self::find_hash_par_worker(
-            proof,
+            worker_request.challenge,
             worker_request.cutoff_time,
             cores,
             config.min_difficulty as u32,
@@ -371,25 +326,30 @@ impl Miner {
             invitation_code: invitation_code.to_string(),
         };
 
-        send_message(&write_half, MessageType::AuthRequest, &auth_request)
+        send_message(&write_half, &WorkerMessage::AuthRequest(auth_request))
             .await
             .unwrap();
 
         println!("Sent authentication request to server");
 
-        let auth_response: AuthResponse = receive_message(&read_half).await.unwrap();
+        let auth_response: ServerMessage =
+            receive_message::<ServerMessage>(&read_half).await.unwrap();
 
-        if !auth_response.success {
-            log_error(&auth_response.message, false);
-        } else {
-            log_info(&auth_response.message);
+        match auth_response {
+            ServerMessage::AuthResponse(response) => {
+                if !response.success {
+                    log_error(&response.message, false);
+                } else {
+                    log_info(&response.message);
+                }
+                response.success
+            }
+            _ => false,
         }
-
-        auth_response.success
     }
 
     pub async fn find_hash_par_worker(
-        proof: Proof,
+        challenge: [u8; 32],
         cutoff_time: u64,
         cores: u64,
         min_difficulty: u32,
@@ -406,7 +366,6 @@ impl Miner {
             .map(|i| {
                 let global_best_difficulty = Arc::clone(&global_best_difficulty);
                 std::thread::spawn({
-                    let proof = proof.clone();
                     let progress_bar = progress_bar.clone();
                     let mut memory = equix::SolverMemory::new();
                     move || {
@@ -431,7 +390,7 @@ impl Miner {
                             // Create hash
                             if let Ok(hx) = drillx::hash_with_memory(
                                 &mut memory,
-                                &proof.challenge,
+                                &challenge,
                                 &nonce.to_le_bytes(),
                             ) {
                                 let difficulty = hx.difficulty();
