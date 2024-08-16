@@ -62,8 +62,8 @@ struct MessageHeader {
 #[derive(Serialize, Deserialize)]
 enum ServerMessage {
     WorkerRequest(WorkerRequest),
-    StopMiningImmediately,
-    StatusMessage(StatusMessage),
+    StopMining,
+    Status(StatusMessage),
     AuthResponse(AuthResponse),
 }
 
@@ -225,13 +225,13 @@ impl Miner {
                                 println!("Sent mining result to coordinator");
                             }));
                         },
-                        ServerMessage::StopMiningImmediately => {
+                        ServerMessage::StopMining => {
                             println!("Received stop mining command. Stopping mining process.");
                             if let Some(task) = current_mining_task.take() {
                                 task.abort();
                             }
                         },
-                        ServerMessage::StatusMessage(status) => {
+                        ServerMessage::Status(status) => {
                             println!("Received status update:");
                             println!("Pending reward: {} ORE", status.pending_reward);
                             println!("Estimated reward per hour: {} ORE", status.estimated_reward_per_hour);
@@ -257,11 +257,11 @@ impl Miner {
                             .await
                             .unwrap();
                     }
-                    ServerMessage::StopMiningImmediately => {
-                        tx.send(ServerMessage::StopMiningImmediately).await.unwrap();
+                    ServerMessage::StopMining => {
+                        tx.send(ServerMessage::StopMining).await.unwrap();
                     }
-                    ServerMessage::StatusMessage(status) => {
-                        tx.send(ServerMessage::StatusMessage(status)).await.unwrap();
+                    ServerMessage::Status(status) => {
+                        tx.send(ServerMessage::Status(status)).await.unwrap();
                     }
                     _ => {}
                 },
