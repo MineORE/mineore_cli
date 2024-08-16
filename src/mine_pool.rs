@@ -1,6 +1,6 @@
 use crate::args::MineDistributedArgs;
 use crate::mine::format_duration;
-use crate::utils::{get_config, log_error, log_info};
+use crate::utils::{self, get_config, log_error, log_info};
 use crate::Miner;
 use drillx::{equix, Hash, Solution};
 use rand::Rng;
@@ -49,8 +49,8 @@ struct AuthResponse {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct StatusMessage {
-    pending_reward: f64,
-    estimated_reward_per_hour: f64,
+    pending_reward: u64,
+    estimated_reward_per_hour: u64,
     average_hash_rate: f64,
 }
 
@@ -232,10 +232,10 @@ impl Miner {
                             }
                         },
                         ServerMessage::Status(status) => {
-                            println!("Received status update:");
-                            println!("Pending reward: {} ORE", status.pending_reward);
-                            println!("Estimated reward per hour: {} ORE", status.estimated_reward_per_hour);
-                            println!("Average hash rate: {} H/s", status.average_hash_rate);
+                            log_info("Received status update:");
+                            log_info(format!("Pending reward: {} ORE", utils::amount_u64_to_string(status.pending_reward)).as_str());
+                            log_info(format!("Estimated reward per hour: {} ORE", utils::amount_u64_to_string(status.estimated_reward_per_hour)).as_str());
+                            log_info(format!("Average weight in the network (hourly): {} %", status.average_hash_rate).as_str());
                         },
                         _ => {},
                     }
