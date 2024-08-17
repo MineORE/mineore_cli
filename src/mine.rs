@@ -10,7 +10,7 @@ use std::{sync::Arc, sync::RwLock, time::Instant};
 use crate::Miner;
 
 impl Miner {
-    pub async fn find_hash_par(
+    pub async fn _find_hash_par(
         proof: Proof,
         cutoff_time: u64,
         cores: u64,
@@ -139,7 +139,7 @@ impl Miner {
     }
 }
 
-fn calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
+fn _calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
     1.0 + (balance as f64 / top_balance as f64).min(1.0f64)
 }
 

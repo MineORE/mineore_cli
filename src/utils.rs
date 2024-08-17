@@ -5,7 +5,6 @@ use ore_api::{
     state::{Config, Proof, Treasury},
 };
 use ore_utils::AccountDeserialize;
-use serde::Deserialize;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_program::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;

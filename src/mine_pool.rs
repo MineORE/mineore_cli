@@ -123,7 +123,7 @@ async fn receive_message<T: DeserializeOwned>(
     Ok(payload)
 }
 
-fn debug_hex_print(label: &str, bytes: &[u8]) {
+fn _debug_hex_print(label: &str, bytes: &[u8]) {
     const BYTES_PER_LINE: usize = 16;
     println!("{}:", label);
     println!("Length: {} bytes", bytes.len());

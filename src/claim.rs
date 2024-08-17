@@ -6,8 +6,8 @@ use solana_program::pubkey::Pubkey;
 use crate::{args::ClaimArgs, Miner};
 
 impl Miner {
-    pub async fn claim(&self, args: ClaimArgs) {
-        let pubkey = match self.address {
+    pub async fn claim(&self, _args: ClaimArgs) {
+        let _pubkey = match self.address {
             Some(ref address) => Pubkey::from_str(address).expect("Failed to parse address"),
             None => Err("No address provided").expect("Failed to parse address"),
         };
