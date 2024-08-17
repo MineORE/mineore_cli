@@ -9,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use solana_rpc_client::spinner;
 use std::fmt::Write;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::Instant;
+use tokio::time::{interval, Instant};
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
 #[derive(Serialize, Deserialize)]
 struct WorkerResult {
@@ -65,12 +68,14 @@ enum ServerMessage {
     StopMining,
     Status(StatusMessage),
     AuthResponse(AuthResponse),
+    Heartbeat,
 }
 
 #[derive(Serialize, Deserialize)]
 enum WorkerMessage {
     WorkerResult(WorkerResult),
     AuthRequest(AuthRequest),
+    Heartbeat,
 }
 
 /**
@@ -198,9 +203,16 @@ impl Miner {
         });
 
         let mut current_mining_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
 
         loop {
             tokio::select! {
+                _ = heartbeat_interval.tick() => {
+                    if let Err(e) = send_message(&write_half, &WorkerMessage::Heartbeat).await {
+                        println!("Error sending heartbeat to server: {}", e);
+                        break;
+                    }
+                }
                 Some(message) = rx.recv() => {
                     match message {
                         ServerMessage::WorkerRequest(worker_request) => {
@@ -236,6 +248,13 @@ impl Miner {
                             log_info(format!("Pending reward: {} ORE", utils::amount_u64_to_string(status.pending_reward)).as_str());
                             log_info(format!("Estimated reward per hour: {} ORE", utils::amount_u64_to_string(status.estimated_reward_per_hour)).as_str());
                             log_info(format!("Average weight in the network (hourly): {} %", status.average_hash_rate).as_str());
+                        },
+                        ServerMessage::Heartbeat => {
+                            // Respond to server's heartbeat
+                            if let Err(e) = send_message(&write_half, &WorkerMessage::Heartbeat).await {
+                                println!("Error sending heartbeat response to server: {}", e);
+                                break;
+                            }
                         },
                         _ => {},
                     }
