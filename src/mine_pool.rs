@@ -209,7 +209,7 @@ impl Miner {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
                     if let Err(e) = send_message(&write_half, &WorkerMessage::Heartbeat).await {
-                        println!("Error sending heartbeat to server: {}", e);
+                        println!("Error sending heartbeat to pool: {}", e);
                         break;
                     }
                 }
@@ -221,9 +221,10 @@ impl Miner {
                                 worker_request.cutoff_time, worker_request.core_offset, worker_request.total_cores
                             );
 
-                            // If there's an ongoing mining task, cancel it
+                            // If there's an ongoing mining task, abort it
                             if let Some(task) = current_mining_task.take() {
                                 task.abort();
+                                println!("Aborted previous mining task");
                             }
 
                             // Start a new mining task
@@ -232,9 +233,10 @@ impl Miner {
                             current_mining_task = Some(tokio::spawn(async move {
                                 let result = Self::perform_mining(miner, worker_request, args.cores).await;
                                 if let Err(e) = send_message(&write_half, &WorkerMessage::WorkerResult(result)).await {
-                                    println!("Error sending mining result to coordinator: {}", e);
+                                    println!("Error sending mining result to pool: {}", e);
+                                } else {
+                                    println!("Sent mining result to pool");
                                 }
-                                println!("Sent mining result to coordinator");
                             }));
                         },
                         ServerMessage::StopMining => {
@@ -261,6 +263,11 @@ impl Miner {
                 },
                 else => break,
             }
+        }
+        // Ensure any running mining task is aborted when exiting the loop
+        if let Some(task) = current_mining_task.take() {
+            task.abort();
+            println!("Aborted final mining task before exiting");
         }
     }
 
