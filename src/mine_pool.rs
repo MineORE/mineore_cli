@@ -69,7 +69,7 @@ enum ServerMessage {
     Status(StatusMessage),
     AuthResponse(AuthResponse),
     Heartbeat,
-    LateSubmissionWarning,
+    LateSubmissionWarning(Duration),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -292,15 +292,15 @@ impl Miner {
                                 break;
                             }
                         },
-                        ServerMessage::LateSubmissionWarning => {
+                        ServerMessage::LateSubmissionWarning(delay) => {
                             log_error("Received late submission warning", false);
                             log_info("Increase the cutoff time to avoid late submissions");
 
-                            // Increase the cutoff time offset
+                            // Update the cutoff time offset
                             let mut cutoff_time_offset = cutoff_time_offset.lock().await;
-                            *cutoff_time_offset += 300;
+                            *cutoff_time_offset = delay.as_millis() as u64;
 
-                            log_info(format!("Cutoff time offset increased to {} seconds", *cutoff_time_offset).as_str());
+                            log_info(format!("Cutoff time offset increased by {} ms", delay.as_millis()).as_str());
                         },
                         _ => {},
                     }
