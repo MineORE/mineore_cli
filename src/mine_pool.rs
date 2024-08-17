@@ -1,5 +1,5 @@
 use crate::args::MineDistributedArgs;
-use crate::mine::format_duration;
+use crate::mine::format_duration_ms;
 use crate::utils::{self, get_config, log_error, log_info};
 use crate::Miner;
 use drillx::{equix, Hash, Solution};
@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{interval, Instant};
+use tokio::time::{interval, sleep, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
@@ -69,6 +69,7 @@ enum ServerMessage {
     Status(StatusMessage),
     AuthResponse(AuthResponse),
     Heartbeat,
+    LateSubmissionWarning,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,30 +164,60 @@ impl Miner {
     pub async fn work(self: Arc<Self>, args: MineDistributedArgs) {
         let worker_name = args
             .worker_name
+            .clone()
             .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000000)));
-        let stream = TcpStream::connect(args.pool.expect("No Pool URL specified!"))
-            .await
-            .unwrap();
+        let invitation_code = args.invitation_code.clone().unwrap_or("123456".to_string());
+
+        // Cutoff time offset (use when network is slow)
+        let cutoff_time_offset: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+
+        loop {
+            match self
+                .clone()
+                .connect_and_work(&args, &worker_name, &invitation_code, &cutoff_time_offset)
+                .await
+            {
+                Ok(_) => {
+                    println!("Connection closed. Attempting to reconnect in 15 seconds...");
+                }
+                Err(e) => {
+                    println!(
+                        "Error occurred: {}. Attempting to reconnect in 15 seconds...",
+                        e
+                    );
+                }
+            }
+            sleep(Duration::from_secs(15)).await;
+        }
+    }
+
+    async fn connect_and_work(
+        self: Arc<Self>,
+        args: &MineDistributedArgs,
+        worker_name: &str,
+        invitation_code: &str,
+        cutoff_time_offset: &Arc<Mutex<u64>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stream =
+            TcpStream::connect(args.pool.as_ref().ok_or("No Pool URL specified!")?).await?;
         println!("Connected to coordinator");
 
         let (read_half, write_half) = stream.into_split();
         let read_half = Arc::new(Mutex::new(read_half));
         let write_half = Arc::new(Mutex::new(write_half));
 
-        let invitation_code = args.invitation_code.unwrap_or("123456".to_string());
         // Authenticate with the server
         if !self
             .authenticate_with_server(
                 Arc::clone(&read_half),
                 Arc::clone(&write_half),
                 args.cores,
-                &worker_name,
-                &invitation_code,
+                worker_name,
+                invitation_code,
             )
             .await
         {
-            println!("Authentication with server failed");
-            return;
+            return Err("Authentication with server failed".into());
         }
         println!("Authentication successful");
 
@@ -198,12 +229,14 @@ impl Miner {
 
         // Spawn a task to handle incoming messages
         let read_half_clone = Arc::clone(&read_half);
-        tokio::spawn(async move {
+        let message_handler = tokio::spawn(async move {
             Self::handle_server_messages(read_half_clone, tx).await;
         });
 
         let mut current_mining_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut heartbeat_interval = interval(HEARTBEAT_INTERVAL);
+
+        let cores = args.cores;
 
         loop {
             tokio::select! {
@@ -230,8 +263,9 @@ impl Miner {
                             // Start a new mining task
                             let miner = Arc::clone(&self);
                             let write_half = Arc::clone(&write_half);
+                            let cutoff_time_offset_clone = Arc::clone(&cutoff_time_offset);
                             current_mining_task = Some(tokio::spawn(async move {
-                                let result = Self::perform_mining(miner, worker_request, args.cores).await;
+                                let result = Self::perform_mining(miner, worker_request, cores, cutoff_time_offset_clone).await;
                                 if let Err(e) = send_message(&write_half, &WorkerMessage::WorkerResult(result)).await {
                                     println!("Error sending mining result to pool: {}", e);
                                 } else {
@@ -258,17 +292,33 @@ impl Miner {
                                 break;
                             }
                         },
+                        ServerMessage::LateSubmissionWarning => {
+                            log_error("Received late submission warning", false);
+                            log_info("Increase the cutoff time to avoid late submissions");
+
+                            // Increase the cutoff time offset
+                            let mut cutoff_time_offset = cutoff_time_offset.lock().await;
+                            *cutoff_time_offset += 300;
+
+                            log_info(format!("Cutoff time offset increased to {} seconds", *cutoff_time_offset).as_str());
+                        },
                         _ => {},
                     }
                 },
                 else => break,
             }
         }
+
         // Ensure any running mining task is aborted when exiting the loop
         if let Some(task) = current_mining_task.take() {
             task.abort();
             println!("Aborted final mining task before exiting");
         }
+
+        // Cancel the message handler task
+        message_handler.abort();
+
+        Ok(())
     }
 
     async fn handle_server_messages(
@@ -303,12 +353,21 @@ impl Miner {
         self: Arc<Self>,
         worker_request: WorkerRequest,
         cores: u64,
+        cutoff_time_offset: Arc<Mutex<u64>>,
     ) -> WorkerResult {
         let config = get_config(&self.rpc_client).await;
 
+        let cutoff_time_offset = *cutoff_time_offset.lock().await;
+        let cutoff_time = if worker_request.cutoff_time > 0 {
+            Duration::from_secs(worker_request.cutoff_time)
+                - Duration::from_millis(cutoff_time_offset)
+        } else {
+            Duration::ZERO
+        };
+
         let (solution, best_difficulty, total_nonces) = Self::find_hash_par_worker(
             worker_request.challenge,
-            worker_request.cutoff_time,
+            cutoff_time.as_millis(),
             cores,
             config.min_difficulty as u32,
             worker_request.core_offset,
@@ -376,7 +435,7 @@ impl Miner {
 
     pub async fn find_hash_par_worker(
         challenge: [u8; 32],
-        cutoff_time: u64,
+        cutoff_time: u128,
         cores: u64,
         min_difficulty: u32,
         core_offset: u64,
@@ -435,7 +494,7 @@ impl Miner {
                             if nonce % 100 == 0 {
                                 let global_best_difficulty =
                                     *global_best_difficulty.read().unwrap();
-                                if timer.elapsed().as_secs().ge(&cutoff_time) {
+                                if timer.elapsed().as_millis().ge(&cutoff_time) {
                                     if i.id == 0 {
                                         progress_bar.set_message(format!(
                                             "Mining... (difficulty {})",
@@ -448,11 +507,10 @@ impl Miner {
                                     }
                                 } else if i.id == 0 {
                                     progress_bar.set_message(format!(
-                                        "Mining... (difficulty {}, time {})",
+                                        "Mining... (difficulty {}, time {} ms)",
                                         global_best_difficulty,
-                                        format_duration(
-                                            cutoff_time.saturating_sub(timer.elapsed().as_secs())
-                                                as u32
+                                        format_duration_ms(
+                                            cutoff_time.saturating_sub(timer.elapsed().as_millis())
                                         ),
                                     ));
                                 }

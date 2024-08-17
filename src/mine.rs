@@ -84,7 +84,7 @@ impl Miner {
                                     progress_bar.set_message(format!(
                                         "Mining... (difficulty {}, time {})",
                                         global_best_difficulty,
-                                        format_duration(
+                                        _format_duration(
                                             cutoff_time.saturating_sub(timer.elapsed().as_secs())
                                                 as u32
                                         ),
@@ -143,8 +143,15 @@ fn _calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
     1.0 + (balance as f64 / top_balance as f64).min(1.0f64)
 }
 
-pub fn format_duration(seconds: u32) -> String {
+pub fn _format_duration(seconds: u32) -> String {
     let minutes = seconds / 60;
     let remaining_seconds = seconds % 60;
+    format!("{:02}:{:02}", minutes, remaining_seconds)
+}
+
+pub fn format_duration_ms(milliseconds: u128) -> String {
+    let total_seconds = milliseconds / 1000;
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
     format!("{:02}:{:02}", minutes, remaining_seconds)
 }
