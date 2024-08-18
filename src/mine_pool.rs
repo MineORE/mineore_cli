@@ -339,6 +339,14 @@ impl Miner {
                     ServerMessage::Status(status) => {
                         tx.send(ServerMessage::Status(status)).await.unwrap();
                     }
+                    ServerMessage::Heartbeat => {
+                        tx.send(ServerMessage::Heartbeat).await.unwrap();
+                    }
+                    ServerMessage::LateSubmissionWarning(delay) => {
+                        tx.send(ServerMessage::LateSubmissionWarning(delay))
+                            .await
+                            .unwrap();
+                    }
                     _ => {}
                 },
                 Err(e) => {
