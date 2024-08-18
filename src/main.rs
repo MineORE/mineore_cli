@@ -39,6 +39,9 @@ enum Commands {
 
     #[command(about = "Mining distributed")]
     MineDistributed(MineDistributedArgs),
+
+    #[command(about = "Pool status of the miner")]
+    Status(StatusArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -93,6 +96,9 @@ async fn main() {
         }
         Commands::MineDistributed(args) => {
             miner.work(args).await;
+        }
+        Commands::Status(args) => {
+            miner.get_status(args).await;
         }
     }
 }

@@ -124,3 +124,14 @@ pub struct MineDistributedArgs {
     #[arg(long, help = "Invitation code (optional)")]
     pub invitation_code: Option<String>,
 }
+
+#[derive(Parser, Debug)]
+pub struct StatusArgs {
+    #[arg(long, help = "Pool URL (required for worker)")]
+    pub pool: Option<String>,
+    #[arg(long, help = "Worker name (required for worker)")]
+    pub worker_name: Option<String>,
+
+    #[arg(long, help = "Invitation code (optional)")]
+    pub invitation_code: Option<String>,
+}

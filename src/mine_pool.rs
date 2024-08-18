@@ -1,4 +1,4 @@
-use crate::args::MineDistributedArgs;
+use crate::args::{MineDistributedArgs, StatusArgs};
 use crate::mine::format_duration_ms;
 use crate::utils::{self, get_config, log_error, log_info};
 use crate::Miner;
@@ -77,11 +77,12 @@ enum WorkerMessage {
     WorkerResult(WorkerResult),
     AuthRequest(AuthRequest),
     Heartbeat,
+    StatusRequest,
 }
 
 /**
  * Packet visualization:
- * | Header size (4 bytes) | Header | Payload |
+ * | header_size | header bytes | payload bytes |
  */
 async fn send_message<T: Serialize>(
     write_half: &Arc<Mutex<OwnedWriteHalf>>,
@@ -188,6 +189,80 @@ impl Miner {
                 }
             }
             sleep(Duration::from_secs(15)).await;
+        }
+    }
+
+    pub async fn get_status(self: Arc<Self>, args: StatusArgs) {
+        let worker_name = args
+            .worker_name
+            .clone()
+            .unwrap_or_else(|| format!("Worker-{}", rand::thread_rng().gen_range(0..1000000)));
+        let invitation_code = args.invitation_code.clone().unwrap_or("123456".to_string());
+
+        match self
+            .connect_and_get_status(&args, &worker_name, &invitation_code)
+            .await
+        {
+            Ok(status) => {
+                println!("Status received:");
+                println!(
+                    "Pending reward: {} ORE",
+                    utils::amount_u64_to_string(status.pending_reward)
+                );
+                println!(
+                    "Estimated reward per hour: {} ORE",
+                    utils::amount_u64_to_string(status.estimated_reward_per_hour)
+                );
+                println!(
+                    "Average weight in the network (hourly): {} %",
+                    status.average_hash_rate
+                );
+            }
+            Err(e) => {
+                println!("Error getting status: {}", e);
+            }
+        }
+    }
+
+    async fn connect_and_get_status(
+        self: &Arc<Self>,
+        args: &StatusArgs,
+        worker_name: &str,
+        invitation_code: &str,
+    ) -> Result<StatusMessage, Box<dyn std::error::Error>> {
+        let stream =
+            TcpStream::connect(args.pool.as_ref().ok_or("No Pool URL specified!")?).await?;
+        println!("Connected to coordinator");
+
+        let (read_half, write_half) = stream.into_split();
+        let read_half = Arc::new(Mutex::new(read_half));
+        let write_half = Arc::new(Mutex::new(write_half));
+
+        // Authenticate with the server using 0 cores
+        if !self
+            .authenticate_with_server(
+                Arc::clone(&read_half),
+                Arc::clone(&write_half),
+                0, // Use 0 cores
+                worker_name,
+                invitation_code,
+            )
+            .await
+        {
+            return Err("Authentication with server failed".into());
+        }
+        println!("Authentication successful");
+
+        // Send status request
+        send_message(&write_half, &WorkerMessage::StatusRequest).await?;
+        println!("Sent status request to server");
+
+        // Receive status response
+        let status_response: ServerMessage = receive_message(&read_half).await?;
+
+        match status_response {
+            ServerMessage::Status(status) => Ok(status),
+            _ => Err("Unexpected response from server".into()),
         }
     }
 
@@ -515,7 +590,7 @@ impl Miner {
                                     }
                                 } else if i.id == 0 {
                                     progress_bar.set_message(format!(
-                                        "Mining... (difficulty {}, time {} ms)",
+                                        "Mining... (difficulty {}, time {} s)",
                                         global_best_difficulty,
                                         format_duration_ms(
                                             cutoff_time.saturating_sub(timer.elapsed().as_millis())
