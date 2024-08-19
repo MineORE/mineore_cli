@@ -38,7 +38,7 @@ enum Commands {
     Rewards(RewardsArgs),
 
     #[command(about = "Mining distributed")]
-    MineDistributed(MineDistributedArgs),
+    Mine(MineDistributedArgs),
 
     #[command(about = "Pool status of the miner")]
     Status(StatusArgs),
@@ -94,7 +94,7 @@ async fn main() {
         Commands::Rewards(_) => {
             miner.rewards().await;
         }
-        Commands::MineDistributed(args) => {
+        Commands::Mine(args) => {
             miner.work(args).await;
         }
         Commands::Status(args) => {
