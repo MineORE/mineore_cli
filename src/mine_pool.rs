@@ -332,8 +332,8 @@ impl Miner {
                             match message {
                                 ServerMessage::WorkerRequest(worker_request) => {
                                     println!(
-                                        "Received new mining request. Cutoff time: {} seconds, start nonce: {}, end nonce: {}",
-                                        worker_request.cutoff_time, worker_request.start_nonce, worker_request.end_nonce
+                                        "Received new mining request. Cutoff time: {} seconds",
+                                        worker_request.cutoff_time
                                     );
 
                                     // If there's an ongoing mining task, abort it
