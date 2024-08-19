@@ -1,6 +1,6 @@
 [package]
 name = "mineore-cli"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "A command line interface for ORE cryptocurrency mining. Modified to use with MineORE.app"
