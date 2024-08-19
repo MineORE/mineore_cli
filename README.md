@@ -10,6 +10,18 @@ To install the CLI, use [cargo](https://doc.rust-lang.org/cargo/getting-started/
 cargo install mineore-cli
 ```
 
+## Mining
+To start mining, run the following commands
+```sh
+mineore --address <YOUR_SOLANA_BASE58_ADDRESS> mine --cores <NUMBER_OF_YOUR_CORES>
+```
+
+## Roadmap
+- Mobile mining
+- GPU Support
+- Optimized CPU mining
+- Improved rewards calculation
+- More mining pools in other regions
 
 ### Dependencies
 If you run into issues during installation, please install the following dependencies for your operating system and try again:
