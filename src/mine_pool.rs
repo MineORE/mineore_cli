@@ -14,9 +14,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{interval, sleep, Instant};
+use tokio::time::{interval, sleep, timeout, Instant};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 #[derive(Serialize, Deserialize)]
 struct WorkerResult {
@@ -25,14 +27,16 @@ struct WorkerResult {
     pub total_hashes: u64,
     pub worker_addr: String,
     pub round_id: i32,
+    pub start_nonce: u64,
+    pub end_nonce: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct WorkerRequest {
     pub challenge: [u8; 32],
     pub cutoff_time: u64,
-    pub core_offset: u64,
-    pub total_cores: u64,
+    pub start_nonce: u64,
+    pub end_nonce: u64,
     pub round_id: i32,
 }
 
@@ -42,6 +46,7 @@ struct AuthRequest {
     pub cores_count: u64,
     pub worker_name: String,
     pub invitation_code: String,
+    pub version: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -321,66 +326,77 @@ impl Miner {
                         break;
                     }
                 }
-                Some(message) = rx.recv() => {
-                    match message {
-                        ServerMessage::WorkerRequest(worker_request) => {
-                            println!(
-                                "Received new mining request. Cutoff time: {} seconds, core offset: {}, Total cores: {}",
-                                worker_request.cutoff_time, worker_request.core_offset, worker_request.total_cores
-                            );
+                result = timeout(RECONNECT_TIMEOUT, rx.recv()) => {
+                    match result {
+                        Ok(Some(message)) => {
+                            match message {
+                                ServerMessage::WorkerRequest(worker_request) => {
+                                    println!(
+                                        "Received new mining request. Cutoff time: {} seconds, start nonce: {}, end nonce: {}",
+                                        worker_request.cutoff_time, worker_request.start_nonce, worker_request.end_nonce
+                                    );
 
-                            // If there's an ongoing mining task, abort it
-                            if let Some(task) = current_mining_task.take() {
-                                task.abort();
-                                println!("Aborted previous mining task");
+                                    // If there's an ongoing mining task, abort it
+                                    if let Some(task) = current_mining_task.take() {
+                                        task.abort();
+                                        println!("Aborted previous mining task");
+                                    }
+
+                                    // Start a new mining task
+                                    let miner = Arc::clone(&self);
+                                    let write_half = Arc::clone(&write_half);
+                                    let cutoff_time_offset_clone = Arc::clone(&cutoff_time_offset);
+                                    current_mining_task = Some(tokio::spawn(async move {
+                                        let result = Self::perform_mining(miner, worker_request, cores, cutoff_time_offset_clone).await;
+                                        if let Err(e) = send_message(&write_half, &WorkerMessage::WorkerResult(result)).await {
+                                            println!("Error sending mining result to pool: {}", e);
+                                        } else {
+                                            println!("Sent mining result to pool");
+                                        }
+                                    }));
+                                },
+                                ServerMessage::StopMining => {
+                                    println!("Received stop mining command. Stopping mining process.");
+                                    if let Some(task) = current_mining_task.take() {
+                                        task.abort();
+                                    }
+                                },
+                                ServerMessage::Status(status) => {
+                                    log_info("Received status update:");
+                                    log_info(format!("Pending reward: {} ORE", utils::amount_u64_to_string(status.pending_reward)).as_str());
+                                    log_info(format!("Estimated reward per hour: {} ORE", utils::amount_u64_to_string(status.estimated_reward_per_hour)).as_str());
+                                    log_info(format!("Average weight in the network (hourly): {} %", status.average_hash_rate).as_str());
+                                },
+                                ServerMessage::Heartbeat => {
+                                    // Respond to server's heartbeat
+                                    if let Err(e) = send_message(&write_half, &WorkerMessage::Heartbeat).await {
+                                        println!("Error sending heartbeat response to server: {}", e);
+                                        break;
+                                    }
+                                },
+                                ServerMessage::LateSubmissionWarning(delay) => {
+                                    log_error("Received late submission warning", false);
+                                    log_info("Increase the cutoff time to avoid late submissions");
+
+                                    // Update the cutoff time offset
+                                    let mut cutoff_time_offset = cutoff_time_offset.lock().await;
+                                    *cutoff_time_offset = delay.as_millis() as u64;
+
+                                    log_info(format!("Cutoff time offset increased by {} ms", delay.as_millis()).as_str());
+                                },
+                                _ => {},
                             }
-
-                            // Start a new mining task
-                            let miner = Arc::clone(&self);
-                            let write_half = Arc::clone(&write_half);
-                            let cutoff_time_offset_clone = Arc::clone(&cutoff_time_offset);
-                            current_mining_task = Some(tokio::spawn(async move {
-                                let result = Self::perform_mining(miner, worker_request, cores, cutoff_time_offset_clone).await;
-                                if let Err(e) = send_message(&write_half, &WorkerMessage::WorkerResult(result)).await {
-                                    println!("Error sending mining result to pool: {}", e);
-                                } else {
-                                    println!("Sent mining result to pool");
-                                }
-                            }));
                         },
-                        ServerMessage::StopMining => {
-                            println!("Received stop mining command. Stopping mining process.");
-                            if let Some(task) = current_mining_task.take() {
-                                task.abort();
-                            }
+                        Ok(None) => {
+                            println!("Channel closed. Exiting...");
+                            break;
                         },
-                        ServerMessage::Status(status) => {
-                            log_info("Received status update:");
-                            log_info(format!("Pending reward: {} ORE", utils::amount_u64_to_string(status.pending_reward)).as_str());
-                            log_info(format!("Estimated reward per hour: {} ORE", utils::amount_u64_to_string(status.estimated_reward_per_hour)).as_str());
-                            log_info(format!("Average weight in the network (hourly): {} %", status.average_hash_rate).as_str());
-                        },
-                        ServerMessage::Heartbeat => {
-                            // Respond to server's heartbeat
-                            if let Err(e) = send_message(&write_half, &WorkerMessage::Heartbeat).await {
-                                println!("Error sending heartbeat response to server: {}", e);
-                                break;
-                            }
-                        },
-                        ServerMessage::LateSubmissionWarning(delay) => {
-                            log_error("Received late submission warning", false);
-                            log_info("Increase the cutoff time to avoid late submissions");
-
-                            // Update the cutoff time offset
-                            let mut cutoff_time_offset = cutoff_time_offset.lock().await;
-                            *cutoff_time_offset = delay.as_millis() as u64;
-
-                            log_info(format!("Cutoff time offset increased by {} ms", delay.as_millis()).as_str());
-                        },
-                        _ => {},
+                        Err(_) => {
+                            println!("No mining request received for 3 minutes. Reconnecting...");
+                            break;
+                        }
                     }
-                },
-                else => break,
+                }
             }
         }
 
@@ -453,8 +469,8 @@ impl Miner {
             cutoff_time.as_millis(),
             cores,
             config.min_difficulty as u32,
-            worker_request.core_offset,
-            worker_request.total_cores,
+            worker_request.start_nonce,
+            worker_request.end_nonce,
         )
         .await;
 
@@ -469,6 +485,8 @@ impl Miner {
             total_hashes: total_nonces,
             worker_addr: "".to_string(),
             round_id: worker_request.round_id,
+            start_nonce: worker_request.start_nonce,
+            end_nonce: worker_request.end_nonce,
         }
     }
 
@@ -492,6 +510,7 @@ impl Miner {
             cores_count,
             worker_name: worker_name.to_string(),
             invitation_code: invitation_code.to_string(),
+            version: VERSION.to_string(),
         };
 
         send_message(&write_half, &WorkerMessage::AuthRequest(auth_request))
@@ -521,36 +540,38 @@ impl Miner {
         cutoff_time: u128,
         cores: u64,
         min_difficulty: u32,
-        core_offset: u64,
-        total_cores: u64,
+        start_nonce: u64,
+        end_nonce: u64,
     ) -> (Solution, u32, u64) {
         // Dispatch job to each core
         let progress_bar = Arc::new(spinner::new_progress_bar());
         let global_best_difficulty = Arc::new(RwLock::new(0u32));
         progress_bar.set_message("Mining...");
         let core_ids = core_affinity::get_core_ids().unwrap();
+        let nonce_range = end_nonce.saturating_sub(start_nonce);
+        let nonces_per_core = nonce_range.saturating_div(cores);
+
         let handles: Vec<_> = core_ids
             .into_iter()
-            .map(|i| {
+            .take(cores as usize)
+            .enumerate()
+            .map(|(i, core)| {
                 let global_best_difficulty = Arc::clone(&global_best_difficulty);
                 std::thread::spawn({
                     let progress_bar = progress_bar.clone();
                     let mut memory = equix::SolverMemory::new();
                     move || {
-                        // Return if core should not be used
-                        if (i.id as u64).ge(&cores) {
-                            return (0, 0, Hash::default(), 0);
-                        }
-
                         // Pin to core
-                        let _ = core_affinity::set_for_current(i);
+                        let _ = core_affinity::set_for_current(core);
 
                         let timer = Instant::now();
-                        let global_core_id = core_offset + i.id as u64;
-                        let first_nonce = u64::MAX
-                            .saturating_div(total_cores)
-                            .saturating_mul(global_core_id);
-                        let mut nonce = first_nonce;
+                        let core_start_nonce = start_nonce + (i as u64 * nonces_per_core);
+                        let core_end_nonce = if i == cores as usize - 1 {
+                            end_nonce
+                        } else {
+                            core_start_nonce + nonces_per_core
+                        };
+                        let mut nonce = core_start_nonce;
                         let mut best_nonce = nonce;
                         let mut best_difficulty = 0;
                         let mut best_hash = Hash::default();
@@ -573,12 +594,14 @@ impl Miner {
                                 }
                             }
 
-                            // Exit if time has elapsed
+                            // Exit if time has elapsed or nonce range is exhausted
                             if nonce % 100 == 0 {
                                 let global_best_difficulty =
                                     *global_best_difficulty.read().unwrap();
-                                if timer.elapsed().as_millis().ge(&cutoff_time) {
-                                    if i.id == 0 {
+                                if timer.elapsed().as_millis().ge(&cutoff_time)
+                                    || nonce >= core_end_nonce
+                                {
+                                    if i == 0 {
                                         progress_bar.set_message(format!(
                                             "Mining... (difficulty {})",
                                             global_best_difficulty,
@@ -588,7 +611,7 @@ impl Miner {
                                         // Mine until min difficulty has been met
                                         break;
                                     }
-                                } else if i.id == 0 {
+                                } else if i == 0 {
                                     progress_bar.set_message(format!(
                                         "Mining... (difficulty {}, time {} s)",
                                         global_best_difficulty,
@@ -601,10 +624,18 @@ impl Miner {
 
                             // Increment nonce
                             nonce += 1;
+                            if nonce >= core_end_nonce {
+                                break;
+                            }
                         }
 
                         // Return the best nonce
-                        (best_nonce, best_difficulty, best_hash, nonce - first_nonce)
+                        (
+                            best_nonce,
+                            best_difficulty,
+                            best_hash,
+                            nonce - core_start_nonce,
+                        )
                     }
                 })
             })
