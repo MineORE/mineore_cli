@@ -1,13 +1,13 @@
-# ORE CLI
+# MineORE Pool CLI
 
-A command line interface for ORE cryptocurrency mining.
+A command line interface for ORE cryptocurrency mining with MineORE pool.
 
 ## Install
 
 To install the CLI, use [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html):
 
 ```sh
-cargo install ore-cli
+cargo install mineore-cli
 ```
 
 
@@ -16,7 +16,7 @@ If you run into issues during installation, please install the following depende
 
 #### Linux
 ```
-sudo apt-get install openssl pkg-config libssl-dev
+sudo apt-get install build-essential pkg-config
 ```
 
 #### MacOS (using [Homebrew](https://brew.sh/))
@@ -47,5 +47,5 @@ cargo build --release
 You can use the `-h` flag on any command to pull up a help menu with documentation:
 
 ```sh
-ore -h
+mineore -h
 ```

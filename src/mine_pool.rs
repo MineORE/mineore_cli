@@ -235,8 +235,12 @@ impl Miner {
         worker_name: &str,
         invitation_code: &str,
     ) -> Result<StatusMessage, Box<dyn std::error::Error>> {
-        let stream =
-            TcpStream::connect(args.pool.as_ref().ok_or("No Pool URL specified!")?).await?;
+        let stream = TcpStream::connect(
+            args.pool
+                .as_ref()
+                .unwrap_or(&"alpha.mineore.app:6868".to_string()),
+        )
+        .await?;
         println!("Connected to coordinator");
 
         let (read_half, write_half) = stream.into_split();
