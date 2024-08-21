@@ -70,3 +70,10 @@ pub fn log_info(message: &str) {
     let formatted_message = format!("INFO: {}", message).cyan().bold();
     println!("{}", formatted_message);
 }
+
+pub fn format_duration_ms(milliseconds: u128) -> String {
+    let total_seconds = milliseconds / 1000;
+    let minutes = total_seconds / 60;
+    let remaining_seconds = total_seconds % 60;
+    format!("{:02}:{:02}", minutes, remaining_seconds)
+}

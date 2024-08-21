@@ -3,7 +3,6 @@ mod balance;
 mod benchmark;
 mod claim;
 mod config;
-mod mine;
 mod mine_pool;
 mod rewards;
 mod utils;

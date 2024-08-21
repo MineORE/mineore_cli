@@ -1,7 +1,7 @@
 use crate::args::{MineDistributedArgs, StatusArgs};
-use crate::mine::format_duration_ms;
-use crate::utils::{self, get_config, log_error, log_info};
+use crate::utils::{self, format_duration_ms, get_config, log_error, log_info};
 use crate::Miner;
+use colored::Colorize;
 use drillx::{equix, Hash, Solution};
 use rand::Rng;
 use serde::de::DeserializeOwned;
@@ -167,6 +167,17 @@ fn _debug_hex_print(label: &str, bytes: &[u8]) {
 }
 
 impl Miner {
+    pub fn check_num_cores(&self, cores: u64) {
+        let num_cores = num_cpus::get() as u64;
+        if cores.gt(&num_cores) {
+            println!(
+                "{} Cannot exceeds available cores ({})",
+                "WARNING".bold().yellow(),
+                num_cores
+            );
+        }
+    }
+
     pub async fn work(self: Arc<Self>, args: MineDistributedArgs) {
         let worker_name = args
             .worker_name
